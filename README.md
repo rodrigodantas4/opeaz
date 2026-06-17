@@ -19,4 +19,16 @@ python manage.py test
 | GET | `tree-nodes/{id}/breadcrumb/?entity_type=&entity_id=` | Breadcrumb path |
 | PATCH | `tree-nodes/{id}/move/` | Reparent node (owner context in body) |
 
+### Test / validation only (TODO — remove before production)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `test/laboratories/` | Paginated laboratories (max 50/page) |
+| GET | `test/groupements/` | Paginated groupements (max 50/page) |
+| GET | `test/pharmacies/` | Paginated pharmacies (max 50/page) |
+| POST | `test/seed/` | Load assessment PDF example data (labs, groupements, pharmacies, trees) |
+| GET | `test/tree-nodes/{id}/subtree/?entity_type=&entity_id=` | Full nested subtree from a node (test only) |
+
+Query params: `?page=1`, `?page_size=50` (capped at 50). Seed: `?reset=false` to append without clearing (default `reset=true`).
+
 Architecture decisions: [docs/adr/001-document-tree.md](docs/adr/001-document-tree.md)

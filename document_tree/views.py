@@ -25,8 +25,8 @@ class EntityTreeView(APIView):
             if hasattr(exc, 'message_dict'):
                 raise ValidationError(exc.message_dict) from exc
             raise ValidationError(str(exc)) from exc
-        serializer = AggregatedTreeSerializer(items)
-        return Response(serializer.data)
+        serializer = AggregatedTreeSerializer()
+        return Response(serializer.to_representation(items))
 
 
 class TreeNodeChildrenView(APIView):

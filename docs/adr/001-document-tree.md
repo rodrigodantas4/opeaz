@@ -9,7 +9,7 @@
 
 ## Executive summary
 
-We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentTypes (GenericForeignKey)** for polymorphic owner and polymorphic leaf content, a `**NodeShare`** model for explicit or bulk sharing ("all pharmacies in the groupement"), integrity validation in the service layer + DRF permissions, and a **REST API with a flat list** (`parent_id`) for the aggregated view.
+We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentTypes (GenericForeignKey)** for polymorphic owner and polymorphic leaf content, a **`NodeShare`** model for explicit or bulk sharing ("all pharmacies in the groupement"), integrity validation in the service layer + DRF permissions, and a **REST API with a flat list** (`parent_id`) for the aggregated view.
 
 **Database recommendation:** PostgreSQL — justified in the dedicated section below.
 
@@ -17,6 +17,7 @@ We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentT
 
 ## Decision 0 — Database choice
 
+**Answer:** Use **PostgreSQL** for production and the PoC. Recursive CTEs, strong constraints, and partial indexes fit breadcrumb and subtree queries well. The design stays portable: use CTEs when the database supports them, with an iterative Python fallback for lightweight test environments (e.g. SQLite).
 
 | Option                       | Pros                                                                                                      | Cons                                                                                 |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
@@ -30,6 +31,8 @@ We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentT
 ---
 
 ## Question 1 — Tree structure
+
+**Answer:** Store the tree as an **Adjacency List** — each `TreeNode` has a nullable `parent_id` pointing to its parent. This keeps child listing and node moves cheap (one indexed query / one update), which matches the dominant read pattern (`/children/`) and the required move endpoint. Materialized Path and MPTT were rejected because move and insert costs outweigh their read advantages at the expected folder depth (3–8 levels).
 
 ### Decision: Adjacency List (`parent → TreeNode`)
 
@@ -293,6 +296,8 @@ For this domain:
 
 ## Question 2 — Polymorphic owner
 
+**Answer:** Model the owner with Django **ContentTypes** — a `GenericForeignKey` pair (`owner_content_type`, `owner_object_id`) on `TreeNode`, restricted to `Laboratory`, `Groupement`, and `Pharmacy`. Use the **same mechanism** for leaf content but on **separate fields**, so owner and payload stay independent and both can grow via allowlists without schema changes.
+
 ### Decision: GenericForeignKey via `django.contrib.contenttypes`
 
 ```python
@@ -336,6 +341,8 @@ ALLOWED_OWNER_MODELS = (Laboratory, Groupement, Pharmacy)
 ---
 
 ## Question 3 — Sharing model
+
+**Answer:** Introduce a **`NodeShare`** table that points at the shared node (folder or leaf root) and a recipient — either an explicit entity (`Pharmacy` or `Groupement`) or **all pharmacies in a groupement** via `GROUPEMENT_ALL`. Sharing a folder implicitly exposes its whole subtree at query time; no per-child share rows. A groupement may only share with its member pharmacies; a laboratory may share with any pharmacy or an entire groupement.
 
 ### Decision: `NodeShare` with polymorphic target + "all pharmacies" mode
 
@@ -541,6 +548,8 @@ Implementation: resolve shares applicable to entity → collect shared root `nod
 
 ## Question 4 — Content polymorphism
 
+**Answer:** Leaf nodes reference their business object through a dedicated **`GenericForeignKey`** (`content_content_type`, `content_object_id`), separate from the owner fields. Folders leave content null; leaves must point to an allowed type (`Document`, `Flyer`, `CommercialCondition`). Resolution is handled by `GET /tree-nodes/{id}/content/`, which returns the underlying object with a `content_type` discriminator and signed file URLs where applicable.
+
 ### Decision: dedicated GenericForeignKey (fields separate from owner)
 
 ```python
@@ -668,6 +677,8 @@ flowchart LR
 
 ## Question 5 — Extensibility (Contract in 6 months)
 
+**Answer:** Adding **`Contract`** requires a new model table and code changes only — **no migration on `TreeNode`**. Register `Contract` in the content allowlist and in the leaf resolution serializer registry. The GFK schema already supports new content types without new columns.
+
 ### Impact of adding `Contract`
 
 
@@ -686,6 +697,8 @@ flowchart LR
 ---
 
 ## Question 6 — Permissions and integrity
+
+**Answer:** Enforce integrity in the **service layer** and DRF permission classes. Only the **node owner** may mutate (edit, move, share); shared nodes are read-only for recipients (`is_shared: true`). Share creation is validated centrally — a groupement cannot share with a pharmacy outside its membership. Nodes use **soft delete** (`deleted_at`); deleted nodes are hidden from all readers. In the PoC, the requesting entity comes from the **URL path**; JWT claims are documented for production.
 
 ### Requesting entity context
 
@@ -749,6 +762,8 @@ class TreeNode(models.Model):
 ---
 
 ## Question 7 — Aggregated view
+
+**Answer:** The aggregated endpoint returns a **bootstrap view**: the entity's **own root nodes** plus **shared root nodes**, each with **direct children only** (one level deep). Deeper nodes are loaded lazily via `/children/`. The response is a flat list with `parent_id`, `is_owned`, `is_shared`, and `shared_by` — no full subtree and no recursive CTE on initial load.
 
 ### Decision
 
@@ -830,6 +845,8 @@ Depth-limited aggregation avoids recursive CTE cost on initial load; subtree CTE
 ---
 
 ## Question 8 — API design
+
+**Answer:** Expose the tree as a **flat JSON list** with `parent_id` (not nested JSON). Core endpoints: aggregated tree per entity, list children, resolve leaf content, and create shares; Phase 2 adds breadcrumb and move. Own vs shared nodes are distinguished by `is_owned` / `is_shared` and optional `shared_by` metadata; siblings are ordered alphabetically by `name`.
 
 ### Representation: flat list + `parent_id`
 

@@ -7,9 +7,8 @@ from rest_framework import serializers
 
 from core.models import CommercialCondition, Document, Flyer
 
-from .models import NodeShare, NodeType, ShareScope, TreeNode
-from .services import ShareService, TreeService
-from .validators import ENTITY_TYPE_MAP, get_entity
+from .models import NodeType, ShareScope, TreeNode
+from .validators import ENTITY_TYPE_MAP
 
 
 class SharedBySerializer(serializers.Serializer):

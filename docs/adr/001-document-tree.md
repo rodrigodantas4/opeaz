@@ -11,11 +11,25 @@
 
 We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentTypes (GenericForeignKey)** for polymorphic owner and polymorphic leaf content, a **`NodeShare`** model for explicit or bulk sharing ("all pharmacies in the groupement"), integrity validation in the service layer + DRF permissions, and a **REST API with a flat list** (`parent_id`) for the aggregated view.
 
-**Database recommendation:** PostgreSQL — justified in the dedicated section below.
+**Database recommendation:** PostgreSQL — justified in [Decision 0](#decision-0--database-choice).
+
+### Decisions at a glance
+
+| Topic | Summary |
+|-------|---------|
+| [Decision 0 — Database choice](#decision-0-database-choice) | **PostgreSQL** for production and PoC; portable CTE/fallback strategy for tests |
+| [Question 1 — Tree structure](#question-1--tree-structure) | **Adjacency List** (`parent_id`); cheap moves and `/children/`; MP/MPTT rejected at expected depth |
+| [Question 2 — Polymorphic owner](#question-2--polymorphic-owner) | **ContentTypes GFK** for owner; same pattern on separate fields for leaf content |
+| [Question 3 — Sharing model](#question-3--sharing-model) | **`NodeShare`** with explicit target or `GROUPEMENT_ALL`; implicit subtree inheritance |
+| [Question 4 — Content polymorphism](#question-4--content-polymorphism) | Dedicated **content GFK** on leaves; resolved via `GET /tree-nodes/{id}/content/` |
+| [Question 5 — Extensibility](#question-5--extensibility-contract-in-6-months) | **`Contract`** = new table + allowlist only; no `TreeNode` schema change |
+| [Question 6 — Permissions and integrity](#question-6--permissions-and-integrity) | Owner-only mutations; validated shares; **soft delete**; URL path auth in PoC |
+| [Question 7 — Aggregated view](#question-7--aggregated-view) | Bootstrap view: own + shared **roots** and **first level only**; lazy `/children/` |
+| [Question 8 — API design](#question-8--api-design) | **Flat list** + `parent_id`; core CRUD/navigation endpoints; `is_owned` / `is_shared` metadata |
 
 ---
 
-## Decision 0 — Database choice
+## Decision 0. Database choice
 
 **Answer:** Use **PostgreSQL** for production and the PoC. Recursive CTEs, strong constraints, and partial indexes fit breadcrumb and subtree queries well. The design stays portable: use CTEs when the database supports them, with an iterative Python fallback for lightweight test environments (e.g. SQLite).
 

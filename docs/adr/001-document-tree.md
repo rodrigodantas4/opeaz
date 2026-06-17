@@ -23,7 +23,7 @@ We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentT
 | [Question 3 — Sharing model](#question-3--sharing-model) | **`NodeShare`** with explicit target or `GROUPEMENT_ALL`; implicit subtree inheritance |
 | [Question 4 — Content polymorphism](#question-4--content-polymorphism) | Dedicated **content GFK** on leaves; resolved via `GET /tree-nodes/{id}/content/` |
 | [Question 5 — Extensibility](#question-5--extensibility-contract-in-6-months) | **`Contract`** = new table + allowlist only; no `TreeNode` schema change |
-| [Question 6 — Permissions and integrity](#question-6--permissions-and-integrity) | Owner-only mutations; validated shares; **soft delete**; URL path auth in PoC |
+| [Question 6 — Permissions and integrity](#question-6--permissions-and-integrity) | Owner-only mutations; validated shares; **soft delete**; Django session auth in PoC |
 | [Question 7 — Aggregated view](#question-7--aggregated-view) | Bootstrap view: own + shared **roots** and **first level only**; lazy `/children/` |
 | [Question 8 — API design](#question-8--api-design) | **Flat list** + `parent_id`; core CRUD/navigation endpoints; `is_owned` / `is_shared` metadata |
 
@@ -712,19 +712,21 @@ flowchart LR
 
 ## Question 6 — Permissions and integrity
 
-**Answer:** Enforce integrity in the **service layer** and DRF permission classes. Only the **node owner** may mutate (edit, move, share); shared nodes are read-only for recipients (`is_shared: true`). Share creation is validated centrally — a groupement cannot share with a pharmacy outside its membership. Nodes use **soft delete** (`deleted_at`); deleted nodes are hidden from all readers. In the PoC, the requesting entity comes from the **URL path**; JWT claims are documented for production.
+**Answer:** Enforce integrity in the **service layer** and DRF permission classes. Only the **node owner** may mutate (edit, move, share); shared nodes are read-only for recipients (`is_shared: true`). Share creation is validated centrally — a groupement cannot share with a pharmacy outside its membership. Nodes use **soft delete** (`deleted_at`); deleted nodes are hidden from all readers. In the PoC, the requesting entity is bound to the **Django session** via `POST /session/entity/`; tree GET endpoints read it server-side. JWT claims are documented for production.
 
 ### Requesting entity context
 
-**PoC / Phase 2:** entity is identified via **URL path** — e.g. `GET /api/v1/entities/pharmacy/7/tree/`. Permissions compare URL `entity_type` + `entity_id` with `node.owner` and applicable shares.
+**PoC / Phase 2:** the client selects an entity once with `POST /api/v1/session/entity/` (`entity_type`, `entity_id`). The server validates the entity exists and stores it in the session. All tree **read** endpoints require that session cookie and resolve the active entity through `EntitySessionAuthentication`. Authorization still compares the session entity with `node.owner` and applicable shares via `TreeService.can_entity_access_node` (404 when denied).
 
-**Production (documented, not implemented in PoC):** migrate to **JWT claim** (`entity_type`, `entity_id` in token) with optional cross-validation URL ↔ claim to prevent IDOR. The `TreeService` layer receives the already-resolved entity — switching mechanism stays isolated in DRF authentication.
+**Production (documented, not implemented in PoC):** migrate to **JWT claim** (`entity_type`, `entity_id` in token). The `TreeService` layer receives the already-resolved entity — switching mechanism stays isolated in DRF authentication.
+
+**Mutations (PoC):** share and move endpoints still accept `sharer_type` / `owner_type` in the request body; binding mutations to session is a follow-up.
 
 ### Defense layers
 
 ```mermaid
 flowchart TD
-    request[DRF Request] --> auth[Authentication]
+    request[DRF Request] --> auth["EntitySessionAuthentication (PoC)"]
     auth --> perm[Permission Class]
     perm --> service[TreeService]
     service --> validate[ShareValidator]
@@ -871,7 +873,8 @@ Rationale: compatible with tree UI components (MUI TreeView, react-arborist), pa
 
 | Method | Path                                               | Description                      |
 | ------ | -------------------------------------------------- | -------------------------------- |
-| `GET`  | `/api/v1/entities/{entity_type}/{entity_id}/tree/` | Aggregated view (own + shared)   |
+| `POST` | `/api/v1/session/entity/`                          | Bind active entity to session    |
+| `GET`  | `/api/v1/entities/tree/`                           | Aggregated view (own + shared)   |
 | `GET`  | `/api/v1/tree-nodes/{id}/children/`                | Direct children of a node        |
 | `GET`  | `/api/v1/tree-nodes/{id}/content/`                 | Resolve leaf → underlying object |
 | `POST` | `/api/v1/tree-nodes/{id}/shares/`                  | Share node                       |
@@ -905,8 +908,12 @@ Fields in response (all read endpoints):
 ### Example — aggregated view (Pharmacy)
 
 ```
-GET /api/v1/entities/pharmacy/7/tree/
+POST /api/v1/session/entity/
+{"entity_type": "pharmacy", "entity_id": 7}
+→ 201 Created (Set-Cookie: sessionid=...)
 
+GET /api/v1/entities/tree/
+Cookie: sessionid=...
 → 200 OK
 [
   {"id": 1, "name": "My documents", "parent_id": null, "is_owned": true, ...},
@@ -949,7 +956,7 @@ Architectural assumptions and resolved design choices for this ADR:
 | 1   | **Lab → Pharmacy direct**    | Allowed **without restriction** — laboratory can share with any pharmacy, regardless of groupement         |
 | 2   | **Sibling ordering**         | **Alphabetical by `name`** — no `position` field in PoC                                                    |
 | 3   | **Shared node naming**       | Separate fields: `name` (persisted) + `shared_by` (API metadata); UI builds label                          |
-| 4   | **Authentication / context** | **URL path** in PoC (`/entities/{type}/{id}/...`); JWT claim documented as production evolution            |
+| 4   | **Authentication / context** | **Django session** in PoC (`POST /session/entity/`); JWT claim documented as production evolution            |
 | 5   | **Soft delete**              | **`deleted_at`** — deleted nodes invisible; shares implicitly inactive; restore out of minimum scope       |
 | 6   | **Expected scale**           | ADR assumptions maintained: 50–200 nodes/owner (PoC), up to 50k (production); 500–2k pharmacies/groupement |
 | 7   | **File storage**             | Leaf resolution returns **signed URL**; object storage infra out of PoC scope                              |

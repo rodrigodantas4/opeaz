@@ -129,7 +129,7 @@ def seed_assessment_data(*, reset: bool = True) -> dict:
             for p in Pharmacy.objects.order_by('name')
         ],
         'primary_pharmacy_id': pharmacy_central.pk,
-        'tree_preview_url': f'/api/v1/entities/pharmacy/{pharmacy_central.pk}/tree/',
+        'tree_preview_url': '/api/v1/entities/tree/',
         'nodes': {
             'my_documents_id': my_documents.pk,
             'vat_leaf_id': vat_leaf.pk,

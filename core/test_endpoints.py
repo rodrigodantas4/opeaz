@@ -3,15 +3,16 @@
 from django.contrib.contenttypes.models import ContentType
 from django.urls import path
 from rest_framework import generics, status
-from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from document_tree.models import TreeNode
+from document_tree.authentication import EntitySessionAuthentication
+from document_tree.context import get_accessible_node_or_404
+from document_tree.mixins import EntityContextMixin
 from document_tree.serializers import serialize_tree_node
 from document_tree.services import TreeService
-from document_tree.validators import get_entity
 
 from .models import Groupement, Laboratory, Pharmacy
 from .seed import seed_assessment_data
@@ -49,6 +50,8 @@ class ValidationEntityPagination(PageNumberPagination):
 class LaboratoryListView(generics.ListAPIView):
     """TODO(test-validation): list laboratories (max 50 per page)."""
 
+    authentication_classes = []
+
     queryset = Laboratory.objects.order_by('name')
     serializer_class = LaboratorySerializer
     pagination_class = ValidationEntityPagination
@@ -56,6 +59,8 @@ class LaboratoryListView(generics.ListAPIView):
 
 class GroupementListView(generics.ListAPIView):
     """TODO(test-validation): list groupements (max 50 per page)."""
+
+    authentication_classes = []
 
     queryset = Groupement.objects.order_by('name')
     serializer_class = GroupementSerializer
@@ -65,6 +70,8 @@ class GroupementListView(generics.ListAPIView):
 class PharmacyListView(generics.ListAPIView):
     """TODO(test-validation): list pharmacies (max 50 per page)."""
 
+    authentication_classes = []
+
     queryset = Pharmacy.objects.select_related('groupement').order_by('name')
     serializer_class = PharmacySerializer
     pagination_class = ValidationEntityPagination
@@ -73,33 +80,22 @@ class PharmacyListView(generics.ListAPIView):
 class SeedAssessmentDataView(APIView):
     """TODO(test-validation): POST to load CPC / Nuxe / Bioderma demo data (optional ?reset=false)."""
 
+    authentication_classes = []
+
     def post(self, request):
         reset = request.query_params.get('reset', 'true').lower() != 'false'
         payload = seed_assessment_data(reset=reset)
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
-class TestTreeNodeSubtreeView(APIView):
+class TestTreeNodeSubtreeView(EntityContextMixin, APIView):
     """TODO(test-validation): recursively list all descendants of a node (nested tree view)."""
 
+    authentication_classes = [EntitySessionAuthentication]
+
     def get(self, request, node_id):
-        entity_type = request.query_params.get('entity_type')
-        entity_id = request.query_params.get('entity_id')
-        if not entity_type or not entity_id:
-            raise ValidationError({'detail': 'entity_type and entity_id query params are required'})
-
-        try:
-            entity = get_entity(entity_type, int(entity_id))
-        except Exception as exc:
-            raise ValidationError(str(exc)) from exc
-
-        try:
-            node = TreeNode.objects.get(pk=node_id)
-        except TreeNode.DoesNotExist as exc:
-            raise NotFound('Node not found') from exc
-
-        if not TreeService.can_entity_access_node(node, entity):
-            raise NotFound('Node not found')
+        entity = self.get_request_entity()
+        node = get_accessible_node_or_404(node_id, entity)
 
         shares = TreeService.get_applicable_shares(entity)
         entity_ct = ContentType.objects.get_for_model(entity.__class__)

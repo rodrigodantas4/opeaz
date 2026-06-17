@@ -11,6 +11,7 @@ from rest_framework.test import APITestCase
 from core.models import CommercialCondition, Document, Flyer, Groupement, Laboratory, Pharmacy
 from document_tree.models import NodeType, ShareScope, TreeNode
 from document_tree.services import ShareService, TreeService
+from document_tree.test_utils import bind_entity_session
 
 
 def ct_for(model):
@@ -98,10 +99,44 @@ class AssessmentFixtureMixin:
             self.lab, self.nuxe_root, ShareScope.EXPLICIT, target=self.pharmacy,
         )
 
+        bind_entity_session(self.client, self.pharmacy)
+
+
+class EntitySessionViewTests(APITestCase):
+    def test_post_session_binds_entity(self):
+        pharmacy = Pharmacy.objects.create(name='Test pharmacy')
+        response = self.client.post(
+            reverse('entity-session'),
+            {'entity_type': 'pharmacy', 'entity_id': pharmacy.pk},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.client.session['entity_type'], 'pharmacy')
+        self.assertEqual(self.client.session['entity_id'], pharmacy.pk)
+
+    def test_post_session_invalid_entity_returns_400(self):
+        response = self.client.post(
+            reverse('entity-session'),
+            {'entity_type': 'pharmacy', 'entity_id': 99999},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_session_clears_entity(self):
+        pharmacy = Pharmacy.objects.create(name='Test pharmacy')
+        self.client.post(
+            reverse('entity-session'),
+            {'entity_type': 'pharmacy', 'entity_id': pharmacy.pk},
+            format='json',
+        )
+        response = self.client.delete(reverse('entity-session'))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertNotIn('entity_type', self.client.session)
+
 
 class EntityTreeViewTests(AssessmentFixtureMixin, APITestCase):
     def test_aggregated_view_includes_own_and_shared_first_level(self):
-        url = reverse('entity-tree', kwargs={'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk})
+        url = reverse('entity-tree')
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         names = {item['name'] for item in response.data}
@@ -119,49 +154,57 @@ class EntityTreeViewTests(AssessmentFixtureMixin, APITestCase):
         self.assertIsNone(cpc['parent_id'])
         self.assertEqual(cpc['shared_by']['entity_type'], 'groupement')
 
-    def test_aggregated_view_unknown_entity_returns_400(self):
-        url = reverse('entity-tree', kwargs={'entity_type': 'pharmacy', 'entity_id': 99999})
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+    def test_aggregated_view_without_session_returns_401(self):
+        session = self.client.session
+        session.pop('entity_type', None)
+        session.pop('entity_id', None)
+        session.save()
+        response = self.client.get(reverse('entity-tree'))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
 class TreeNodeChildrenViewTests(AssessmentFixtureMixin, APITestCase):
     def test_list_children_of_shared_folder(self):
         url = reverse('tree-node-children', kwargs={'node_id': self.cpc_root.pk})
-        response = self.client.get(url, {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk})
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         names = {item['name'] for item in response.data}
         self.assertEqual(names, {'Conditions 2025', 'Groupement flyers'})
 
-    def test_children_requires_entity_context(self):
+    def test_children_requires_session(self):
+        session = self.client.session
+        session.pop('entity_type', None)
+        session.pop('entity_id', None)
+        session.save()
         url = reverse('tree-node-children', kwargs={'node_id': self.cpc_root.pk})
         response = self.client.get(url)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_children_not_accessible_returns_404(self):
         other_pharmacy = Pharmacy.objects.create(name='Other', groupement=None)
+        bind_entity_session(self.client, other_pharmacy)
         url = reverse('tree-node-children', kwargs={'node_id': self.cpc_root.pk})
-        response = self.client.get(url, {'entity_type': 'pharmacy', 'entity_id': other_pharmacy.pk})
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class TreeNodeContentViewTests(AssessmentFixtureMixin, APITestCase):
     def test_resolve_leaf_content(self):
         url = reverse('tree-node-content', kwargs={'node_id': self.conditions_leaf.pk})
-        response = self.client.get(url, {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk})
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['content_type'], 'commercialcondition')
         self.assertEqual(response.data['name'], 'General conditions')
 
     def test_resolve_document_leaf_includes_signed_url(self):
         url = reverse('tree-node-content', kwargs={'node_id': self.vat_leaf.pk})
-        response = self.client.get(url, {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk})
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('sig=', response.data['file_url'])
 
     def test_resolve_folder_returns_400(self):
         url = reverse('tree-node-content', kwargs={'node_id': self.cpc_root.pk})
-        response = self.client.get(url, {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk})
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
@@ -193,7 +236,7 @@ class TreeNodeShareViewTests(AssessmentFixtureMixin, APITestCase):
 class TreeNodeBreadcrumbViewTests(AssessmentFixtureMixin, APITestCase):
     def test_breadcrumb_path(self):
         url = reverse('tree-node-breadcrumb', kwargs={'node_id': self.conditions_leaf.pk})
-        response = self.client.get(url, {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk})
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual([item['name'] for item in response.data], ['CPC', 'Conditions 2025', 'General conditions'])
 

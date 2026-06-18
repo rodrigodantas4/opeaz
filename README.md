@@ -74,23 +74,19 @@ Each section below maps to a **Decisions at a glance** row in the ADR. Run the s
 
 ### 0 — Bootstrap (all manual checks)
 
+No `jq` required — use Python (already installed for this project) or read IDs manually from `seed.json`.
+
+**Bash (Git Bash / Linux / macOS):**
+
 ```bash
 # Load PDF example data (CPC, Nuxe, Bioderma, three pharmacies, full trees)
-curl -X POST http://localhost:8000/api/v1/test/seed/ | tee seed.json
+curl -s -X POST http://localhost:8000/api/v1/test/seed/ -o seed.json
 
 # Optional: list entities to confirm pagination works
 curl "http://localhost:8000/api/v1/test/pharmacies/?page=1"
 
-# Export IDs from the seed response (adjust jq paths if you parse seed.json differently)
-export PRIMARY_PHARMACY_ID=$(jq -r .primary_pharmacy_id seed.json)
-export CPC_GROUPEMENT_ID=$(jq -r '.groupements[0].id' seed.json)
-export NORTE_PHARMACY_ID=$(jq -r '.pharmacies[] | select(.name=="Farmácia Norte") | .id' seed.json)
-export CPC_ROOT_ID=$(jq -r .nodes.cpc_root_id seed.json)
-export CONDITIONS_2025_ID=$(jq -r .nodes.conditions_2025_id seed.json)
-export CONDITIONS_LEAF_ID=$(jq -r .nodes.conditions_leaf_id seed.json)
-export VAT_LEAF_ID=$(jq -r .nodes.vat_leaf_id seed.json)
-export MY_DOCUMENTS_ID=$(jq -r .nodes.my_documents_id seed.json)
-export FLYER_LEAF_ID=$(jq -r .nodes.flyer_leaf_id seed.json)
+# Export IDs from seed.json (Python stdlib helper in scripts/)
+eval "$(python scripts/export_seed_env.py seed.json)"
 
 # Bind session as Farmácia Central (primary_pharmacy_id from seed)
 curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
@@ -98,7 +94,20 @@ curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
   -d '{"entity_type": "pharmacy", "entity_id": '"$PRIMARY_PHARMACY_ID"'}'
 ```
 
-Save node IDs from the seed response `nodes` object if you are not using the `export` lines above. Replace `$…` placeholders in later steps with those values.
+**PowerShell (Windows):**
+
+```powershell
+curl.exe -s -X POST http://localhost:8000/api/v1/test/seed/ -o seed.json
+python scripts/export_seed_env.py seed.json --shell powershell | Invoke-Expression
+
+curl.exe -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ `
+  -H "Content-Type: application/json" `
+  -d "{`"entity_type`": `"pharmacy`", `"entity_id`": $env:PRIMARY_PHARMACY_ID}"
+```
+
+**Without scripting:** open `seed.json` and copy values from `primary_pharmacy_id`, `groupements[0].id`, and the `nodes` object (`cpc_root_id`, `vat_leaf_id`, etc.) into the `$…` placeholders below.
+
+Save node IDs from the seed response `nodes` object if you are not using the export helper. Replace `$…` placeholders in later steps with those values.
 
 Automated regression for the whole PoC:
 
@@ -313,7 +322,7 @@ Expect ordered names: `CPC` → `Condições 2025` → `Condições gerais`.
 
 ## PoC limitations
 
-Intentional shortcuts for the assessment PoC. **Not production-ready** without addressing these.
+Intentional shortcuts for the assessment PoC. **Not production-ready** without addressing these. Architectural detail: [docs/adr/001-document-tree.md](docs/adr/001-document-tree.md#poc-known-limitations).
 
 | Topic | PoC behavior | Production follow-up |
 |-------|--------------|---------------------|

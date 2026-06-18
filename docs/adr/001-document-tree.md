@@ -716,7 +716,7 @@ flowchart LR
 
 ### Requesting entity context
 
-**PoC / Phase 2:** the client selects an entity once with `POST /api/v1/session/entity/` (`entity_type`, `entity_id`). The server validates the entity exists and stores it in the session. All tree **read** endpoints require that session cookie and resolve the active entity through `EntitySessionAuthentication`. Authorization still compares the session entity with `node.owner` and applicable shares via `TreeService.can_entity_access_node` (404 when denied).
+**PoC / Phase 2:** the client selects an entity once with `POST /api/v1/session/entity/` (`entity_type`, `entity_id`). The server validates the entity exists and stores it in the session. All tree **read** endpoints require that session cookie and resolve the active entity through `EntitySessionAuthentication`. Authorization still compares the session entity with `node.owner` and applicable shares via `TreeService.can_entity_access_node`. When the node exists but the entity lacks access, the API returns **403** with `"Entity does not have permission"`. Unknown node IDs return **404**.
 
 **Production (documented, not implemented in PoC):** migrate to **JWT claim** (`entity_type`, `entity_id` in token). The `TreeService` layer receives the already-resolved entity — switching mechanism stays isolated in DRF authentication.
 

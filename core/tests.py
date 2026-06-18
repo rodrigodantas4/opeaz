@@ -50,7 +50,8 @@ class TestTreeNodeSubtreeTests(AssessmentFixtureMixin, APITestCase):
 
         self.assertEqual(conditions['children'][0]['children'], [])
 
-
+        flyers = next(c for c in response.data['children'] if c['name'] == 'Groupement flyers')
+        self.assertEqual(flyers['children'][0]['name'], 'Solar flyer')
 
     def test_subtree_requires_session(self):
         session = self.client.session
@@ -63,17 +64,13 @@ class TestTreeNodeSubtreeTests(AssessmentFixtureMixin, APITestCase):
 
 
 
-    def test_subtree_not_accessible_returns_404(self):
-
+    def test_subtree_not_accessible_returns_403(self):
         other_pharmacy = Pharmacy.objects.create(name='Other', groupement=None)
-
         bind_entity_session(self.client, other_pharmacy)
-
         url = reverse('test-tree-node-subtree', kwargs={'node_id': self.cpc_root.pk})
-
         response = self.client.get(url)
-
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data['detail'], 'Entity does not have permission')
 
 
 

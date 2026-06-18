@@ -146,13 +146,30 @@ class EntityTreeViewTests(AssessmentFixtureMixin, APITestCase):
         self.assertIn('Conditions 2025', names)
         self.assertIn('Groupement flyers', names)
         self.assertIn('Nuxe', names)
+        self.assertIn('Spring operation', names)
         self.assertNotIn('General conditions', names)
         self.assertNotIn('Product brief', names)
+        self.assertNotIn('Solar flyer', names)
+
+        my_docs = next(item for item in response.data if item['name'] == 'My documents')
+        self.assertTrue(my_docs['is_owned'])
+        self.assertFalse(my_docs['is_shared'])
 
         cpc = next(item for item in response.data if item['name'] == 'CPC')
         self.assertTrue(cpc['is_shared'])
         self.assertIsNone(cpc['parent_id'])
         self.assertEqual(cpc['shared_by']['entity_type'], 'groupement')
+
+        nuxe = next(item for item in response.data if item['name'] == 'Nuxe')
+        self.assertFalse(nuxe['is_owned'])
+        self.assertTrue(nuxe['is_shared'])
+        self.assertEqual(nuxe['shared_by']['entity_type'], 'laboratory')
+
+    def test_aggregated_view_is_flat_list_without_nested_children(self):
+        response = self.client.get(reverse('entity-tree'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for item in response.data:
+            self.assertNotIn('children', item)
 
     def test_aggregated_view_without_session_returns_401(self):
         session = self.client.session
@@ -180,12 +197,46 @@ class TreeNodeChildrenViewTests(AssessmentFixtureMixin, APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_children_not_accessible_returns_404(self):
+    def test_children_not_accessible_returns_403(self):
         other_pharmacy = Pharmacy.objects.create(name='Other', groupement=None)
         bind_entity_session(self.client, other_pharmacy)
         url = reverse('tree-node-children', kwargs={'node_id': self.cpc_root.pk})
         response = self.client.get(url)
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data['detail'], 'Entity does not have permission')
+
+    def test_list_grandchildren_of_shared_folder(self):
+        url = reverse('tree-node-children', kwargs={'node_id': self.conditions_folder.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([item['name'] for item in response.data], ['General conditions'])
+
+    def test_children_sorted_alphabetically(self):
+        url = reverse('tree-node-children', kwargs={'node_id': self.cpc_root.pk})
+        response = self.client.get(url)
+        self.assertEqual(
+            [item['name'] for item in response.data],
+            ['Conditions 2025', 'Groupement flyers'],
+        )
+
+    def test_groupement_all_member_can_list_cpc_children(self):
+        member = Pharmacy.objects.create(name='Member pharmacy', groupement=self.groupement)
+        bind_entity_session(self.client, member)
+        url = reverse('tree-node-children', kwargs={'node_id': self.cpc_root.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {item['name'] for item in response.data},
+            {'Conditions 2025', 'Groupement flyers'},
+        )
+
+    def test_explicit_lab_share_denied_for_non_recipient(self):
+        other_pharmacy = Pharmacy.objects.create(name='Other', groupement=None)
+        bind_entity_session(self.client, other_pharmacy)
+        url = reverse('tree-node-children', kwargs={'node_id': self.nuxe_root.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data['detail'], 'Entity does not have permission')
 
 
 class TreeNodeContentViewTests(AssessmentFixtureMixin, APITestCase):
@@ -201,6 +252,13 @@ class TreeNodeContentViewTests(AssessmentFixtureMixin, APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('sig=', response.data['file_url'])
+
+    def test_resolve_flyer_leaf_includes_signed_url(self):
+        url = reverse('tree-node-content', kwargs={'node_id': self.flyer_leaf.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['content_type'], 'flyer')
+        self.assertIn('sig=', response.data['image_url'])
 
     def test_resolve_folder_returns_400(self):
         url = reverse('tree-node-content', kwargs={'node_id': self.cpc_root.pk})
@@ -266,6 +324,29 @@ class TreeNodeMoveViewTests(AssessmentFixtureMixin, APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_move_rejected_for_non_owner(self):
+        url = reverse('tree-node-move', kwargs={'node_id': self.vat_leaf.pk})
+        response = self.client.patch(url, {
+            'owner_type': 'laboratory',
+            'owner_id': self.lab.pk,
+            'parent_id': self.my_docs.pk,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('owner', response.data['detail'].lower())
+
+    def test_move_then_visible_under_new_parent(self):
+        folder = make_folder('Source', self.pharmacy)
+        leaf = make_leaf('Movable leaf', self.pharmacy, self.doc, parent=folder)
+        url = reverse('tree-node-move', kwargs={'node_id': leaf.pk})
+        self.client.patch(url, {
+            'owner_type': 'pharmacy',
+            'owner_id': self.pharmacy.pk,
+            'parent_id': self.my_docs.pk,
+        }, format='json')
+        children_url = reverse('tree-node-children', kwargs={'node_id': self.my_docs.pk})
+        response = self.client.get(children_url)
+        self.assertIn('Movable leaf', {item['name'] for item in response.data})
+
 
 class TreeServiceUnitTests(AssessmentFixtureMixin, TestCase):
     def test_can_entity_access_shared_descendant(self):
@@ -274,3 +355,29 @@ class TreeServiceUnitTests(AssessmentFixtureMixin, TestCase):
     def test_groupement_all_grants_new_pharmacy_access(self):
         new_pharmacy = Pharmacy.objects.create(name='New member', groupement=self.groupement)
         self.assertTrue(TreeService.can_entity_access_node(self.cpc_root, new_pharmacy))
+
+    def test_soft_deleted_nodes_hidden_from_default_manager(self):
+        node = make_folder('To delete', self.pharmacy)
+        from django.utils import timezone
+        TreeNode.all_objects.filter(pk=node.pk).update(deleted_at=timezone.now())
+        self.assertFalse(TreeNode.objects.filter(pk=node.pk).exists())
+        self.assertTrue(TreeNode.all_objects.filter(pk=node.pk).exists())
+
+
+class ValidatorUnitTests(TestCase):
+    def test_validate_content_type_rejects_non_content_model(self):
+        from django.contrib.contenttypes.models import ContentType
+        from django.core.exceptions import ValidationError
+
+        from core.models import Pharmacy
+        from document_tree.validators import validate_content_type
+
+        pharmacy_ct = ContentType.objects.get_for_model(Pharmacy)
+        with self.assertRaises(ValidationError):
+            validate_content_type(pharmacy_ct)
+
+    def test_allowed_content_types_include_document_flyer_and_condition(self):
+        from document_tree.validators import ALLOWED_CONTENT_MODELS
+
+        model_names = {m.__name__ for m in ALLOWED_CONTENT_MODELS}
+        self.assertEqual(model_names, {'Document', 'Flyer', 'CommercialCondition'})

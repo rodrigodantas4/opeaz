@@ -1,5 +1,7 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
-from rest_framework.exceptions import NotAuthenticated, NotFound, ValidationError
+from rest_framework.exceptions import NotAuthenticated, NotFound, PermissionDenied, ValidationError
+
+ENTITY_ACCESS_DENIED_MESSAGE = 'Entity does not have permission'
 
 from .models import TreeNode
 from .services import TreeService
@@ -49,5 +51,5 @@ def get_accessible_node_or_404(node_id, entity) -> TreeNode:
     except TreeNode.DoesNotExist as exc:
         raise NotFound('Node not found') from exc
     if not TreeService.can_entity_access_node(node, entity):
-        raise NotFound('Node not found')
+        raise PermissionDenied(ENTITY_ACCESS_DENIED_MESSAGE)
     return node

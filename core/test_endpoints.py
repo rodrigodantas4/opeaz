@@ -23,7 +23,7 @@ def _node_metadata(node, entity, shares, entity_ct):
     is_owned = node.owner_content_type_id == entity_ct.id and node.owner_object_id == entity.pk
     if is_owned:
         return is_owned, {'is_shared': False, 'shared_by': None}
-    return is_owned, TreeService._share_metadata_for_node(node, shares)
+    return is_owned, TreeService.share_metadata_for_node(node, shares)
 
 
 def _build_subtree(node, entity, shares, entity_ct, *, depth=0):
@@ -33,7 +33,7 @@ def _build_subtree(node, entity, shares, entity_ct, *, depth=0):
     is_owned, meta = _node_metadata(node, entity, shares, entity_ct)
     children = [
         _build_subtree(child, entity, shares, entity_ct, depth=depth + 1)
-        for child in TreeService.get_children(node, entity)
+        for child in TreeService.get_children(node, entity, request=None)
     ]
     return {
         **serialize_tree_node(node, is_owned=is_owned, parent_id=node.parent_id, **meta),
@@ -97,9 +97,9 @@ class TestTreeNodeSubtreeView(EntityContextMixin, APIView):
 
     def get(self, request, node_id):
         entity = self.get_request_entity()
-        node = get_accessible_node_or_404(node_id, entity)
+        node = get_accessible_node_or_404(node_id, entity, request=request)
 
-        shares = TreeService.get_applicable_shares(entity)
+        shares = TreeService.get_applicable_shares(entity, request=request)
         entity_ct = ContentType.objects.get_for_model(entity.__class__)
         return Response(_build_subtree(node, entity, shares, entity_ct))
 

@@ -1,4 +1,3 @@
-import hashlib
 import time
 from urllib.parse import urlencode
 
@@ -7,6 +6,7 @@ from rest_framework import serializers
 
 from core.models import CommercialCondition, Document, Flyer
 
+from .media_views import compute_media_signature
 from .models import NodeType, ShareScope, TreeNode
 from .validators import ENTITY_TYPE_MAP
 
@@ -82,10 +82,9 @@ def build_signed_url(file_field):
     ttl = getattr(settings, 'DOCUMENT_TREE_SIGNED_URL_TTL', 3600)
     expires = int(time.time()) + ttl
     path = file_field.name
-    signature = hashlib.sha256(f'{path}:{expires}:{settings.SECRET_KEY}'.encode()).hexdigest()[:16]
+    signature = compute_media_signature(path, expires)
     query = urlencode({'expires': expires, 'sig': signature})
-    base = file_field.url if hasattr(file_field, 'url') else f'/media/{path}'
-    return f'{base}?{query}'
+    return f'/api/v1/media/{path}?{query}'
 
 
 CONTENT_SERIALIZERS = {

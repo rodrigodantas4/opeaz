@@ -54,6 +54,8 @@ def validate_tree_node(node: TreeNode):
 
 
 def validate_share(sharer, node: TreeNode, scope: str, target=None, groupement=None):
+    if node.deleted_at is not None:
+        raise ValidationError('Cannot share a deleted node')
     sharer_ct = get_content_type_for_model(sharer.__class__)
     if node.owner_content_type_id != sharer_ct.id or node.owner_object_id != sharer.pk:
         raise ValidationError('Only the node owner can create shares')

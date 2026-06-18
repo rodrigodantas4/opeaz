@@ -1,45 +1,37 @@
-import io
 from datetime import date
+from urllib.parse import parse_qs, urlparse
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from core.models import CommercialCondition, Document, Flyer, Groupement, Laboratory, Pharmacy
-from document_tree.models import NodeType, ShareScope, TreeNode
+from core.seed import seed_assessment_data
+from document_tree.models import NodeShare, NodeType, ShareScope, TreeNode
 from document_tree.services import ShareService, TreeService
 from document_tree.test_utils import bind_entity_session
 
 
-def ct_for(model):
-    return ContentType.objects.get_for_model(model)
-
-
 def make_folder(name, owner, parent=None):
-    ct = ct_for(owner.__class__)
-    return TreeNode.objects.create(
+    return TreeService.create_node(
         name=name,
         node_type=NodeType.FOLDER,
+        owner=owner,
         parent=parent,
-        owner_content_type=ct,
-        owner_object_id=owner.pk,
     )
 
 
 def make_leaf(name, owner, content_obj, parent=None):
-    content_ct = ct_for(content_obj.__class__)
-    owner_ct = ct_for(owner.__class__)
-    return TreeNode.objects.create(
+    return TreeService.create_node(
         name=name,
         node_type=NodeType.LEAF,
+        owner=owner,
         parent=parent,
-        owner_content_type=owner_ct,
-        owner_object_id=owner.pk,
-        content_content_type=content_ct,
-        content_object_id=content_obj.pk,
+        content_obj=content_obj,
     )
 
 
@@ -111,8 +103,22 @@ class EntitySessionViewTests(APITestCase):
             format='json',
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['entity_type'], 'pharmacy')
+        self.assertEqual(response.data['entity_id'], pharmacy.pk)
         self.assertEqual(self.client.session['entity_type'], 'pharmacy')
         self.assertEqual(self.client.session['entity_id'], pharmacy.pk)
+
+    def test_post_session_missing_fields_returns_400(self):
+        response = self.client.post(reverse('entity-session'), {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_post_session_invalid_entity_type_returns_400(self):
+        response = self.client.post(
+            reverse('entity-session'),
+            {'entity_type': 'invalid', 'entity_id': 1},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_post_session_invalid_entity_returns_400(self):
         response = self.client.post(
@@ -239,6 +245,19 @@ class TreeNodeChildrenViewTests(AssessmentFixtureMixin, APITestCase):
         self.assertEqual(response.data['detail'], 'Entity does not have permission')
 
 
+    def test_children_unknown_node_returns_404(self):
+        url = reverse('tree-node-children', kwargs={'node_id': 99999})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_children_soft_deleted_node_returns_404(self):
+        node = make_folder('Deleted', self.pharmacy)
+        TreeNode.all_objects.filter(pk=node.pk).update(deleted_at=timezone.now())
+        url = reverse('tree-node-children', kwargs={'node_id': node.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
 class TreeNodeContentViewTests(AssessmentFixtureMixin, APITestCase):
     def test_resolve_leaf_content(self):
         url = reverse('tree-node-content', kwargs={'node_id': self.conditions_leaf.pk})
@@ -265,10 +284,77 @@ class TreeNodeContentViewTests(AssessmentFixtureMixin, APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_content_requires_session(self):
+        session = self.client.session
+        session.pop('entity_type', None)
+        session.pop('entity_id', None)
+        session.save()
+        url = reverse('tree-node-content', kwargs={'node_id': self.vat_leaf.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_content_not_accessible_returns_403(self):
+        other_pharmacy = Pharmacy.objects.create(name='Other', groupement=None)
+        bind_entity_session(self.client, other_pharmacy)
+        url = reverse('tree-node-content', kwargs={'node_id': self.cpc_root.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_content_unknown_node_returns_404(self):
+        url = reverse('tree-node-content', kwargs={'node_id': 99999})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_signed_media_url_serves_file(self):
+        url = reverse('tree-node-content', kwargs={'node_id': self.vat_leaf.pk})
+        response = self.client.get(url)
+        file_url = response.data['file_url']
+        self.assertTrue(file_url.startswith('/api/v1/media/'))
+        media_response = self.client.get(file_url)
+        self.assertEqual(media_response.status_code, status.HTTP_200_OK)
+
+    def test_signed_media_url_rejects_bad_signature(self):
+        url = reverse('tree-node-content', kwargs={'node_id': self.vat_leaf.pk})
+        response = self.client.get(url)
+        parsed = urlparse(response.data['file_url'])
+        query = parse_qs(parsed.query)
+        bad_url = f'{parsed.path}?expires={query["expires"][0]}&sig=invalid'
+        media_response = self.client.get(bad_url)
+        self.assertEqual(media_response.status_code, status.HTTP_404_NOT_FOUND)
+
 
 class TreeNodeShareViewTests(AssessmentFixtureMixin, APITestCase):
     def test_create_explicit_share(self):
+        bind_entity_session(self.client, self.lab)
         folder = make_folder('Lab share', self.lab)
+        url = reverse('tree-node-shares', kwargs={'node_id': folder.pk})
+        response = self.client.post(url, {
+            'scope': ShareScope.EXPLICIT,
+            'target': {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk},
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['node_id'], folder.pk)
+        self.assertEqual(response.data['scope'], ShareScope.EXPLICIT)
+        self.assertEqual(NodeShare.objects.filter(node=folder).count(), 1)
+
+    def test_share_with_session_ignores_body_sharer(self):
+        bind_entity_session(self.client, self.lab)
+        folder = make_folder('Lab share 2', self.lab)
+        url = reverse('tree-node-shares', kwargs={'node_id': folder.pk})
+        response = self.client.post(url, {
+            'sharer_type': 'pharmacy',
+            'sharer_id': self.pharmacy.pk,
+            'scope': ShareScope.EXPLICIT,
+            'target': {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk},
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_share_without_session_uses_body_fallback(self):
+        session = self.client.session
+        session.pop('entity_type', None)
+        session.pop('entity_id', None)
+        session.save()
+        folder = make_folder('Body fallback', self.lab)
         url = reverse('tree-node-shares', kwargs={'node_id': folder.pk})
         response = self.client.post(url, {
             'sharer_type': 'laboratory',
@@ -278,13 +364,52 @@ class TreeNodeShareViewTests(AssessmentFixtureMixin, APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
+    def test_share_without_session_or_body_returns_401(self):
+        self.client.logout()
+        folder = make_folder('Unauthorized', self.lab)
+        url = reverse('tree-node-shares', kwargs={'node_id': folder.pk})
+        response = self.client.post(url, {
+            'scope': ShareScope.EXPLICIT,
+            'target': {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk},
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_create_groupement_all_share(self):
+        bind_entity_session(self.client, self.groupement)
+        folder = make_folder('All members', self.groupement)
+        url = reverse('tree-node-shares', kwargs={'node_id': folder.pk})
+        response = self.client.post(url, {
+            'scope': ShareScope.GROUPEMENT_ALL,
+            'groupement_id': self.groupement.pk,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['scope'], ShareScope.GROUPEMENT_ALL)
+
+    def test_share_non_owner_rejected(self):
+        bind_entity_session(self.client, self.pharmacy)
+        folder = make_folder('Not mine', self.lab)
+        url = reverse('tree-node-shares', kwargs={'node_id': folder.pk})
+        response = self.client.post(url, {
+            'scope': ShareScope.EXPLICIT,
+            'target': {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk},
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_share_unknown_node_returns_404(self):
+        bind_entity_session(self.client, self.lab)
+        url = reverse('tree-node-shares', kwargs={'node_id': 99999})
+        response = self.client.post(url, {
+            'scope': ShareScope.EXPLICIT,
+            'target': {'entity_type': 'pharmacy', 'entity_id': self.pharmacy.pk},
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
     def test_groupement_cannot_share_with_foreign_pharmacy(self):
+        bind_entity_session(self.client, self.groupement)
         foreign = Pharmacy.objects.create(name='Foreign', groupement=None)
         folder = make_folder('Groupement only', self.groupement)
         url = reverse('tree-node-shares', kwargs={'node_id': folder.pk})
         response = self.client.post(url, {
-            'sharer_type': 'groupement',
-            'sharer_id': self.groupement.pk,
             'scope': ShareScope.EXPLICIT,
             'target': {'entity_type': 'pharmacy', 'entity_id': foreign.pk},
         }, format='json')
@@ -298,9 +423,65 @@ class TreeNodeBreadcrumbViewTests(AssessmentFixtureMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual([item['name'] for item in response.data], ['CPC', 'Conditions 2025', 'General conditions'])
 
+    def test_breadcrumb_requires_session(self):
+        session = self.client.session
+        session.pop('entity_type', None)
+        session.pop('entity_id', None)
+        session.save()
+        url = reverse('tree-node-breadcrumb', kwargs={'node_id': self.conditions_leaf.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_breadcrumb_not_accessible_returns_403(self):
+        other_pharmacy = Pharmacy.objects.create(name='Other', groupement=None)
+        bind_entity_session(self.client, other_pharmacy)
+        url = reverse('tree-node-breadcrumb', kwargs={'node_id': self.conditions_leaf.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_breadcrumb_unknown_node_returns_404(self):
+        url = reverse('tree-node-breadcrumb', kwargs={'node_id': 99999})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
 
 class TreeNodeMoveViewTests(AssessmentFixtureMixin, APITestCase):
     def test_move_node(self):
+        folder = make_folder('Movable', self.pharmacy)
+        leaf = make_leaf('Child', self.pharmacy, self.doc, parent=folder)
+        url = reverse('tree-node-move', kwargs={'node_id': leaf.pk})
+        response = self.client.patch(url, {'parent_id': self.my_docs.pk}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        leaf.refresh_from_db()
+        self.assertEqual(leaf.parent_id, self.my_docs.pk)
+
+    def test_move_to_root(self):
+        leaf = make_leaf('Root candidate', self.pharmacy, self.doc, parent=self.my_docs)
+        url = reverse('tree-node-move', kwargs={'node_id': leaf.pk})
+        response = self.client.patch(url, {'parent_id': None}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        leaf.refresh_from_db()
+        self.assertIsNone(leaf.parent_id)
+
+    def test_move_into_descendant_rejected(self):
+        parent = make_folder('Parent', self.pharmacy)
+        child = make_folder('Child', self.pharmacy, parent=parent)
+        url = reverse('tree-node-move', kwargs={'node_id': parent.pk})
+        response = self.client.patch(url, {'parent_id': child.pk}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_move_rejected_for_non_owner(self):
+        bind_entity_session(self.client, self.lab)
+        url = reverse('tree-node-move', kwargs={'node_id': self.vat_leaf.pk})
+        response = self.client.patch(url, {'parent_id': self.my_docs.pk}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('owner', response.data['detail'].lower())
+
+    def test_move_without_session_uses_body_fallback(self):
+        session = self.client.session
+        session.pop('entity_type', None)
+        session.pop('entity_id', None)
+        session.save()
         folder = make_folder('Movable', self.pharmacy)
         leaf = make_leaf('Child', self.pharmacy, self.doc, parent=folder)
         url = reverse('tree-node-move', kwargs={'node_id': leaf.pk})
@@ -310,39 +491,30 @@ class TreeNodeMoveViewTests(AssessmentFixtureMixin, APITestCase):
             'parent_id': self.my_docs.pk,
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        leaf.refresh_from_db()
-        self.assertEqual(leaf.parent_id, self.my_docs.pk)
 
-    def test_move_into_descendant_rejected(self):
-        parent = make_folder('Parent', self.pharmacy)
-        child = make_folder('Child', self.pharmacy, parent=parent)
-        url = reverse('tree-node-move', kwargs={'node_id': parent.pk})
-        response = self.client.patch(url, {
-            'owner_type': 'pharmacy',
-            'owner_id': self.pharmacy.pk,
-            'parent_id': child.pk,
-        }, format='json')
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_move_rejected_for_non_owner(self):
+    def test_move_without_session_or_body_returns_401(self):
+        self.client.logout()
         url = reverse('tree-node-move', kwargs={'node_id': self.vat_leaf.pk})
-        response = self.client.patch(url, {
-            'owner_type': 'laboratory',
-            'owner_id': self.lab.pk,
-            'parent_id': self.my_docs.pk,
-        }, format='json')
+        response = self.client.patch(url, {'parent_id': self.my_docs.pk}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_move_unknown_node_returns_404(self):
+        url = reverse('tree-node-move', kwargs={'node_id': 99999})
+        response = self.client.patch(url, {'parent_id': self.my_docs.pk}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_move_cross_owner_parent_rejected(self):
+        lab_folder = make_folder('Lab folder', self.lab)
+        leaf = make_leaf('Pharmacy leaf', self.pharmacy, self.doc, parent=self.my_docs)
+        url = reverse('tree-node-move', kwargs={'node_id': leaf.pk})
+        response = self.client.patch(url, {'parent_id': lab_folder.pk}, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('owner', response.data['detail'].lower())
 
     def test_move_then_visible_under_new_parent(self):
         folder = make_folder('Source', self.pharmacy)
         leaf = make_leaf('Movable leaf', self.pharmacy, self.doc, parent=folder)
         url = reverse('tree-node-move', kwargs={'node_id': leaf.pk})
-        self.client.patch(url, {
-            'owner_type': 'pharmacy',
-            'owner_id': self.pharmacy.pk,
-            'parent_id': self.my_docs.pk,
-        }, format='json')
+        self.client.patch(url, {'parent_id': self.my_docs.pk}, format='json')
         children_url = reverse('tree-node-children', kwargs={'node_id': self.my_docs.pk})
         response = self.client.get(children_url)
         self.assertIn('Movable leaf', {item['name'] for item in response.data})
@@ -358,10 +530,62 @@ class TreeServiceUnitTests(AssessmentFixtureMixin, TestCase):
 
     def test_soft_deleted_nodes_hidden_from_default_manager(self):
         node = make_folder('To delete', self.pharmacy)
-        from django.utils import timezone
         TreeNode.all_objects.filter(pk=node.pk).update(deleted_at=timezone.now())
         self.assertFalse(TreeNode.objects.filter(pk=node.pk).exists())
         self.assertTrue(TreeNode.all_objects.filter(pk=node.pk).exists())
+
+    def test_create_node_rejects_leaf_without_content(self):
+        from django.core.exceptions import ValidationError
+
+        with self.assertRaises(ValidationError):
+            TreeService.create_node(
+                name='Bad leaf',
+                node_type=NodeType.LEAF,
+                owner=self.pharmacy,
+                parent=self.my_docs,
+            )
+
+
+class ShareServiceUnitTests(AssessmentFixtureMixin, TestCase):
+    def test_create_explicit_share(self):
+        folder = make_folder('Share me', self.lab)
+        share = ShareService.create_share(
+            self.lab, folder, ShareScope.EXPLICIT, target=self.pharmacy,
+        )
+        self.assertEqual(share.scope, ShareScope.EXPLICIT)
+        self.assertEqual(share.node_id, folder.pk)
+
+
+class EndToEndFlowTests(APITestCase):
+    def test_seed_bind_tree_children_content_breadcrumb(self):
+        seed_assessment_data(reset=True)
+        pharmacy_id = Pharmacy.objects.get(name='Farmácia Central').pk
+        bind_entity_session(self.client, Pharmacy.objects.get(pk=pharmacy_id))
+
+        tree_response = self.client.get(reverse('entity-tree'))
+        self.assertEqual(tree_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(any(item['name'] == 'Meus documentos' for item in tree_response.data))
+
+        my_docs = TreeNode.objects.get(name='Meus documentos')
+        children_response = self.client.get(
+            reverse('tree-node-children', kwargs={'node_id': my_docs.pk}),
+        )
+        self.assertEqual(children_response.status_code, status.HTTP_200_OK)
+
+        vat_leaf = TreeNode.objects.get(name='Declaração IVA')
+        content_response = self.client.get(
+            reverse('tree-node-content', kwargs={'node_id': vat_leaf.pk}),
+        )
+        self.assertEqual(content_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(content_response.data['content_type'], 'document')
+
+        cpc_root = TreeNode.objects.get(name='CPC', parent__isnull=True)
+        conditions_leaf = TreeNode.objects.get(name='Condições gerais')
+        breadcrumb_response = self.client.get(
+            reverse('tree-node-breadcrumb', kwargs={'node_id': conditions_leaf.pk}),
+        )
+        self.assertEqual(breadcrumb_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(breadcrumb_response.data[0]['name'], 'CPC')
 
 
 class ValidatorUnitTests(TestCase):
@@ -381,3 +605,32 @@ class ValidatorUnitTests(TestCase):
 
         model_names = {m.__name__ for m in ALLOWED_CONTENT_MODELS}
         self.assertEqual(model_names, {'Document', 'Flyer', 'CommercialCondition'})
+
+    def test_validate_tree_node_rejects_invalid_folder(self):
+        from django.contrib.contenttypes.models import ContentType
+        from django.core.exceptions import ValidationError
+
+        from document_tree.validators import validate_tree_node
+
+        node = TreeNode(
+            name='Bad',
+            node_type=NodeType.FOLDER,
+            owner_content_type=ContentType.objects.get_for_model(Pharmacy),
+            owner_object_id=1,
+            content_content_type=ContentType.objects.get_for_model(Document),
+            content_object_id=1,
+        )
+        with self.assertRaises(ValidationError):
+            validate_tree_node(node)
+
+    def test_flyer_end_before_start_rejected(self):
+        from django.core.exceptions import ValidationError
+
+        flyer = Flyer(
+            laboratory=Laboratory.objects.create(name='L', code='L1'),
+            title='Bad dates',
+            start_at=date(2025, 12, 1),
+            end_at=date(2025, 1, 1),
+        )
+        with self.assertRaises(ValidationError):
+            flyer.full_clean()

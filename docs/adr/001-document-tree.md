@@ -11,21 +11,21 @@
 
 We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentTypes (GenericForeignKey)** for polymorphic owner and polymorphic leaf content, a **`NodeShare`** model for explicit or bulk sharing ("all pharmacies in the groupement"), integrity validation in the service layer + DRF permissions, and a **REST API with a flat list** (`parent_id`) for the aggregated view.
 
-**Database recommendation:** PostgreSQL — justified in [Decision 0](#decision-0--database-choice).
+**Database recommendation:** PostgreSQL for production — justified in [Decision 0](#decision-0--database-choice). The Phase 2 reference implementation runs on SQLite; see [PoC known limitations](#poc-known-limitations).
 
 ### Decisions at a glance
 
 | Topic | Summary |
 |-------|---------|
-| [Decision 0 — Database choice](#decision-0-database-choice) | **PostgreSQL** for production and PoC; portable CTE/fallback strategy for tests |
+| [Decision 0 — Database choice](#decision-0-database-choice) | **PostgreSQL** target; Phase 2 repo uses **SQLite** locally; portable CTE/fallback strategy |
 | [Question 1 — Tree structure](#question-1--tree-structure) | **Adjacency List** (`parent_id`); cheap moves and `/children/`; MP/MPTT rejected at expected depth |
 | [Question 2 — Polymorphic owner](#question-2--polymorphic-owner) | **ContentTypes GFK** for owner; same pattern on separate fields for leaf content |
 | [Question 3 — Sharing model](#question-3--sharing-model) | **`NodeShare`** with explicit target or `GROUPEMENT_ALL`; implicit subtree inheritance |
 | [Question 4 — Content polymorphism](#question-4--content-polymorphism) | Dedicated **content GFK** on leaves; resolved via `GET /tree-nodes/{id}/content/` |
 | [Question 5 — Extensibility](#question-5--extensibility-contract-in-6-months) | **`Contract`** = new table + allowlist only; no `TreeNode` schema change |
-| [Question 6 — Permissions and integrity](#question-6--permissions-and-integrity) | Owner-only mutations; validated shares; **soft delete**; Django session auth in PoC |
+| [Question 6 — Permissions and integrity](#question-6--permissions-and-integrity) | Owner-only mutations; validated shares; **soft delete**; session auth (reads + session-first mutations) |
 | [Question 7 — Aggregated view](#question-7--aggregated-view) | Bootstrap view: own + shared **roots** and **first level only**; lazy `/children/` |
-| [Question 8 — API design](#question-8--api-design) | **Flat list** + `parent_id`; core CRUD/navigation endpoints; `is_owned` / `is_shared` metadata |
+| [Question 8 — API design](#question-8--api-design) | **Flat list** + `parent_id`; navigation + share/move; signed **media** endpoint; `is_owned` / `is_shared` metadata |
 
 ---
 
@@ -40,7 +40,9 @@ We propose an **Adjacency List** (`parent_id`) as the tree structure, **ContentT
 | SQLite                       | Simple for PoC                                                                                            | No efficient recursive CTE in older versions; unsuitable for multi-tenant production |
 
 
-**Decision:** PostgreSQL for production and PoC (Docker/local). The architecture remains portable — breadcrumb/subtree queries use CTE when available, with an iterative Python fallback for lightweight test environments.
+**Decision:** PostgreSQL for production and deployed PoC (Docker/local). The architecture remains portable — breadcrumb/subtree queries use CTE when available, with an iterative Python fallback for lightweight test environments.
+
+**Phase 2 implementation note:** the reference repository at `opeaz/` uses **SQLite** for local development and automated tests (`config/settings.py`). Behaviour matches this ADR; only query-plan optimisations (recursive CTE) differ. See [PoC known limitations](#poc-known-limitations).
 
 ---
 
@@ -685,7 +687,7 @@ flowchart LR
 
 **Resolution endpoint:** `GET /tree-nodes/{id}/content/` → serializes underlying object with `content_type` discriminator.
 
-**File URLs:** response includes **signed URL with short TTL** for `Document.file` and `Flyer.image`. Storage details (S3/GCS, credential rotation) are **out of PoC scope** — assume configurable adapter via Django settings.
+**File URLs:** leaf resolution returns a **signed URL** (`expires` + `sig` query params, TTL from `DOCUMENT_TREE_SIGNED_URL_TTL`). Clients download files via `GET /api/v1/media/{path}?expires=…&sig=…`, which verifies the signature and expiry before serving from `MEDIA_ROOT`. Raw `/media/…` is exposed in `DEBUG` only (admin/dev); production clients should use signed URLs. Object storage (S3/GCS) is **out of PoC scope**.
 
 ---
 
@@ -720,26 +722,30 @@ flowchart LR
 
 **Production (documented, not implemented in PoC):** migrate to **JWT claim** (`entity_type`, `entity_id` in token). The `TreeService` layer receives the already-resolved entity — switching mechanism stays isolated in DRF authentication.
 
-**Mutations (PoC):** share and move endpoints still accept `sharer_type` / `owner_type` in the request body; binding mutations to session is a follow-up.
+**Mutations (PoC):** share and move endpoints use **session-first** identity via `OptionalEntitySessionAuthentication`. When a session entity is bound, it is the sharer/owner and body `sharer_type`/`owner_type` fields are ignored. When no session is present, those body fields are accepted as a **manual testing fallback** (documented in [README PoC limitations](../../README.md#poc-limitations)). Production should require JWT/session only. Missing both session and body identity returns **401**.
+
+**Node creation (PoC):** tree nodes are created through `TreeService.create_node()`, which calls `validate_tree_node()` (folder/leaf content rules, allowed content types). Seed data and tests use the same path.
 
 ### Defense layers
 
 ```mermaid
 flowchart TD
-    request[DRF Request] --> auth["EntitySessionAuthentication (PoC)"]
-    auth --> perm[Permission Class]
-    perm --> service[TreeService]
-    service --> validate[ShareValidator]
-    validate --> db[(PostgreSQL)]
+    request[DRF Request] --> readAuth["EntitySessionAuthentication — reads"]
+    request --> mutAuth["OptionalEntitySessionAuthentication — share/move"]
+    readAuth --> service[TreeService]
+    mutAuth --> resolver[resolve_mutation_entity]
+    resolver --> service
+    service --> validate[validators + ShareService]
+    validate --> db[(Database)]
 ```
 
 
 
 ### 6a — Pharmacy cannot modify shared node
 
-- **Rule:** mutations (`PUT/PATCH/DELETE`, move, share) allowed only if `request.entity == node.owner`
-- **DRF implementation:** `IsNodeOwner` permission class
-- Nodes visible via share are flagged with `is_shared: true`; the UI treats shared nodes as read-only (mutations enforced server-side via `IsNodeOwner`)
+- **Rule:** mutations (move, share) allowed only if the resolved entity (`request.entity` from session or body fallback) **owns** the node
+- **PoC implementation:** `resolve_mutation_entity()` picks session entity first; move/share views compare owner ContentType + PK; `validate_share()` enforces sharer == node owner
+- Nodes visible via share are flagged with `is_shared: true`; the UI treats shared nodes as read-only (server rejects non-owner mutations with **400**)
 
 ### 6b — Prevent share with wrong pharmacy
 
@@ -754,7 +760,8 @@ def validate_share(sharer, node, target, scope):
     # Laboratory → Groupement or Pharmacy: no membership restriction
 ```
 
-- **DB constraints:** `CheckConstraint` for scope/target consistency; FK `groupement` with `PROTECT`
+- **DB constraints:** `CheckConstraint` for scope/target consistency (uses `ShareScope` enum values)
+- **Service rules:** `validate_share()` rejects soft-deleted nodes and groupement→foreign-pharmacy explicit shares
 - **Atomic transaction** on share creation
 
 ### 6c — Soft delete
@@ -868,22 +875,34 @@ Depth-limited aggregation avoids recursive CTE cost on initial load; subtree CTE
 
 Rationale: compatible with tree UI components (MUI TreeView, react-arborist), paginable, avoids deep nested JSON.
 
-### Main endpoints
+### Main endpoints (product API)
 
 
-| Method | Path                                               | Description                      |
-| ------ | -------------------------------------------------- | -------------------------------- |
-| `POST` | `/api/v1/session/entity/`                          | Bind active entity to session    |
-| `GET`  | `/api/v1/entities/tree/`                           | Aggregated view (own + shared)   |
-| `GET`  | `/api/v1/tree-nodes/{id}/children/`                | Direct children of a node        |
-| `GET`  | `/api/v1/tree-nodes/{id}/content/`                 | Resolve leaf → underlying object |
-| `POST` | `/api/v1/tree-nodes/{id}/shares/`                  | Share node                       |
+| Method | Path                                               | Auth (PoC)              | Description                      |
+| ------ | -------------------------------------------------- | ----------------------- | -------------------------------- |
+| `POST` | `/api/v1/session/entity/`                          | None                    | Bind active entity to session    |
+| `DELETE` | `/api/v1/session/entity/`                        | None                    | Clear session entity             |
+| `GET`  | `/api/v1/entities/tree/`                           | Session required        | Aggregated view (own + shared)   |
+| `GET`  | `/api/v1/tree-nodes/{id}/children/`                | Session required        | Direct children of a node        |
+| `GET`  | `/api/v1/tree-nodes/{id}/content/`                 | Session required        | Resolve leaf → underlying object |
+| `GET`  | `/api/v1/tree-nodes/{id}/breadcrumb/`              | Session required        | Breadcrumb path to node          |
+| `POST` | `/api/v1/tree-nodes/{id}/shares/`                  | Session-first           | Create share                     |
+| `PATCH` | `/api/v1/tree-nodes/{id}/move/`                   | Session-first           | Reparent node (owner tree)       |
+| `GET`  | `/api/v1/media/{path}`                             | Signed query params     | Download `Document` / `Flyer` file |
 
+**Session-first** (share/move): bound session entity is authoritative; optional body `sharer_type`/`sharer_id` or `owner_type`/`owner_id` when no session (manual testing only — see README).
 
-**Additional endpoints (Phase 2):**
+### Test / validation endpoints (PoC only)
 
-- `GET /api/v1/tree-nodes/{id}/breadcrumb/`
-- `PATCH /api/v1/tree-nodes/{id}/move/`
+Mounted when `DEBUG=True` or during `manage.py test` — **not available when `DEBUG=False`**. See [README](../../README.md) Phase 2 bootstrap.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| `POST` | `/api/v1/test/seed/` | Load/wipe assessment demo data (`?reset=true` default) |
+| `GET` | `/api/v1/test/laboratories/` | Paginated laboratory list |
+| `GET` | `/api/v1/test/groupements/` | Paginated groupement list |
+| `GET` | `/api/v1/test/pharmacies/` | Paginated pharmacy list |
+| `GET` | `/api/v1/test/tree-nodes/{id}/subtree/` | Full nested subtree (session required) |
 
 ### Own vs shared distinction
 
@@ -907,9 +926,11 @@ Fields in response (all read endpoints):
 
 ### Example — aggregated view (Pharmacy)
 
+Use entity and node PKs from `POST /api/v1/test/seed/` (or `scripts/export_seed_env.py`) — do not hardcode IDs.
+
 ```
 POST /api/v1/session/entity/
-{"entity_type": "pharmacy", "entity_id": 7}
+{"entity_type": "pharmacy", "entity_id": <primary_pharmacy_id>}
 → 201 Created (Set-Cookie: sessionid=...)
 
 GET /api/v1/entities/tree/
@@ -923,6 +944,8 @@ Cookie: sessionid=...
   ...
 ]
 ```
+
+**Automated regression:** `python manage.py test` — **70 tests** (see [README test mapping](../../README.md#phase-2--automated-test-mapping)).
 
 ---
 
@@ -956,10 +979,10 @@ Architectural assumptions and resolved design choices for this ADR:
 | 1   | **Lab → Pharmacy direct**    | Allowed **without restriction** — laboratory can share with any pharmacy, regardless of groupement         |
 | 2   | **Sibling ordering**         | **Alphabetical by `name`** — no `position` field in PoC                                                    |
 | 3   | **Shared node naming**       | Separate fields: `name` (persisted) + `shared_by` (API metadata); UI builds label                          |
-| 4   | **Authentication / context** | **Django session** in PoC (`POST /session/entity/`); JWT claim documented as production evolution            |
-| 5   | **Soft delete**              | **`deleted_at`** — deleted nodes invisible; shares implicitly inactive; restore out of minimum scope       |
+| 4   | **Authentication / context** | **Django session** for reads (`EntitySessionAuthentication`); share/move **session-first** with optional body identity fallback; JWT documented for production |
+| 5   | **Soft delete**              | **`deleted_at`** — deleted nodes invisible; shares on deleted nodes rejected at creation; restore out of minimum scope       |
 | 6   | **Expected scale**           | ADR assumptions maintained: 50–200 nodes/owner (PoC), up to 50k (production); 500–2k pharmacies/groupement |
-| 7   | **File storage**             | Leaf resolution returns **signed URL**; object storage infra out of PoC scope                              |
+| 7   | **File storage**             | Leaf resolution returns **signed URL** served via `GET /api/v1/media/…`; object storage infra out of PoC scope              |
 
 
 ---
@@ -1190,5 +1213,25 @@ Minimum metrics before scaling mitigations:
 - p99 aggregated view > 500 ms for 5 min → review cache (R1)
 - move updates > 100 rows (MP) → alert product / throttling (R6)
 - share count per pharmacy > 100 → review share modeling (R5)
+
+---
+
+## PoC known limitations
+
+See [README.md](../../README.md#poc-limitations) for the full table. Summary of gaps between this ADR and the Phase 2 reference implementation:
+
+| Topic | ADR / production target | Phase 2 repo behaviour |
+|-------|-------------------------|-------------------------|
+| Database | PostgreSQL | SQLite locally (`config/settings.py`) |
+| Authentication | JWT / real user login | Anyone can bind any entity via `POST /session/entity/` |
+| Mutations | Session/JWT only | Session-first; body `sharer_*` / `owner_*` fallback without session |
+| Signed files | Verified download URL | `GET /api/v1/media/{path}?expires=&sig=` (implemented) |
+| Test API | Removed in production | `/api/v1/test/*` when `DEBUG=True` or during tests |
+| `NodeShare.permission` | RBAC | Schema only — not enforced |
+| Content vs tree owner | Business rule | Not enforced (seed may cross-link lab content under pharmacy nodes) |
+| Breadcrumb / ancestor walks | Recursive CTE at scale | Python parent walk capped at `TreeService.MAX_DEPTH` (20) |
+| Share cache | Redis / CDN (future) | Request-scoped in-memory cache per HTTP request |
+
+Manual validation steps and curl examples: [README Phase 2](../../README.md#phase-2--step-by-step-validation).
 
 ---

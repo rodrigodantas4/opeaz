@@ -1,5 +1,5 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
-from rest_framework.exceptions import NotAuthenticated, NotFound, PermissionDenied, ValidationError
+from rest_framework.exceptions import AuthenticationFailed, NotAuthenticated, NotFound, PermissionDenied, ValidationError
 
 ENTITY_ACCESS_DENIED_MESSAGE = 'Entity does not have permission'
 
@@ -9,6 +9,11 @@ from .validators import get_entity
 
 SESSION_ENTITY_TYPE_KEY = 'entity_type'
 SESSION_ENTITY_ID_KEY = 'entity_id'
+
+MUTATION_AUTH_MESSAGE = (
+    'Bind an entity session (POST /session/entity/) or provide identity fields '
+    'in the request body (PoC manual testing only).'
+)
 
 
 def get_session_entity_keys(request) -> tuple[str, int]:
@@ -38,6 +43,7 @@ def set_session_entity(request, entity_type: str, entity_id: int):
         raise ValidationError(str(exc)) from exc
     request.session[SESSION_ENTITY_TYPE_KEY] = entity_type
     request.session[SESSION_ENTITY_ID_KEY] = entity_id
+    request.session.cycle_key()
 
 
 def clear_session_entity(request):
@@ -45,11 +51,37 @@ def clear_session_entity(request):
     request.session.pop(SESSION_ENTITY_ID_KEY, None)
 
 
-def get_accessible_node_or_404(node_id, entity) -> TreeNode:
+def resolve_mutation_entity(request, *, type_key: str, id_key: str):
+    """
+    Session-first entity for share/move mutations.
+
+    When a session entity is bound it is authoritative (body identity ignored).
+    Otherwise falls back to request body fields for PoC manual testing.
+    """
+    entity = getattr(request, 'entity', None)
+    if entity is not None:
+        return entity
+
+    entity_type = request.data.get(type_key)
+    entity_id = request.data.get(id_key)
+    if entity_type and entity_id is not None:
+        try:
+            return get_entity(entity_type, int(entity_id))
+        except DjangoValidationError as exc:
+            if hasattr(exc, 'message_dict'):
+                raise ValidationError(exc.message_dict) from exc
+            raise ValidationError(str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({id_key: 'Must be an integer'}) from exc
+
+    raise AuthenticationFailed(MUTATION_AUTH_MESSAGE)
+
+
+def get_accessible_node_or_404(node_id, entity, request=None) -> TreeNode:
     try:
         node = TreeNode.objects.get(pk=node_id)
     except TreeNode.DoesNotExist as exc:
         raise NotFound('Node not found') from exc
-    if not TreeService.can_entity_access_node(node, entity):
+    if not TreeService.can_entity_access_node(node, entity, request=request):
         raise PermissionDenied(ENTITY_ACCESS_DENIED_MESSAGE)
     return node

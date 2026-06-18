@@ -4,39 +4,30 @@ import shutil
 from datetime import date
 
 from django.conf import settings
-from django.contrib.contenttypes.models import ContentType
 from django.core.files.base import ContentFile
 from django.db import transaction
 
 from core.models import CommercialCondition, Document, Flyer, Groupement, Laboratory, Pharmacy
 from document_tree.models import NodeShare, NodeType, ShareScope, TreeNode
-from document_tree.services import ShareService
-
-
-def _ct(model):
-    return ContentType.objects.get_for_model(model)
+from document_tree.services import ShareService, TreeService
 
 
 def _folder(name, owner, parent=None):
-    ct = _ct(owner.__class__)
-    return TreeNode.objects.create(
+    return TreeService.create_node(
         name=name,
         node_type=NodeType.FOLDER,
+        owner=owner,
         parent=parent,
-        owner_content_type=ct,
-        owner_object_id=owner.pk,
     )
 
 
 def _leaf(name, owner, content_obj, parent=None):
-    return TreeNode.objects.create(
+    return TreeService.create_node(
         name=name,
         node_type=NodeType.LEAF,
+        owner=owner,
         parent=parent,
-        owner_content_type=_ct(owner.__class__),
-        owner_object_id=owner.pk,
-        content_content_type=_ct(content_obj.__class__),
-        content_object_id=content_obj.pk,
+        content_obj=content_obj,
     )
 
 

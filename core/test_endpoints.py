@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from document_tree.authentication import EntitySessionAuthentication
-from document_tree.context import get_accessible_node_or_404
+from document_tree.context import clear_session_entity, get_accessible_node_or_404
 from document_tree.mixins import EntityContextMixin
 from document_tree.serializers import serialize_tree_node
 from document_tree.services import TreeService
@@ -84,6 +84,8 @@ class SeedAssessmentDataView(APIView):
 
     def post(self, request):
         reset = request.query_params.get('reset', 'true').lower() != 'false'
+        if reset:
+            clear_session_entity(request)
         payload = seed_assessment_data(reset=reset)
         return Response(payload, status=status.HTTP_201_CREATED)
 

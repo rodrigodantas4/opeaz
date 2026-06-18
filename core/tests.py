@@ -5,14 +5,15 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 
-
 from document_tree.test_utils import bind_entity_session
 
 from document_tree.tests import AssessmentFixtureMixin
 
 
 
-from .models import Groupement, Laboratory, Pharmacy
+from document_tree.models import NodeShare, TreeNode
+
+from .models import Document, Groupement, Laboratory, Pharmacy
 
 from .seed import seed_assessment_data
 
@@ -155,19 +156,50 @@ class SeedAssessmentDataTests(APITestCase):
         self.assertIn('tree_preview_url', response.data)
 
         self.assertIn('cpc_root_id', response.data['nodes'])
+        self.assertTrue(response.data['reset'])
+        self.assertIn('cleared_before', response.data)
 
 
 
     def test_seed_module_idempotent_with_reset(self):
+        seed_assessment_data(reset=True)
+        self.assertEqual(Laboratory.objects.filter(code='NUXE').count(), 1)
+        self.assertEqual(TreeNode.all_objects.count(), 10)
+        self.assertEqual(NodeShare.objects.count(), 2)
 
         seed_assessment_data(reset=True)
-
         self.assertEqual(Laboratory.objects.filter(code='NUXE').count(), 1)
-
-        seed_assessment_data(reset=True)
-
-        self.assertEqual(Laboratory.objects.filter(code='NUXE').count(), 1)
-
         self.assertEqual(Groupement.objects.count(), 1)
+        self.assertEqual(TreeNode.all_objects.count(), 10)
+        self.assertEqual(NodeShare.objects.count(), 2)
+
+    def test_clear_assessment_data_removes_extra_rows(self):
+        seed_assessment_data(reset=True)
+        Groupement.objects.create(name='Leftover')
+        self.assertEqual(Groupement.objects.count(), 2)
+
+        from core.seed import _clear_assessment_data
+        _clear_assessment_data()
+
+        self.assertEqual(Groupement.objects.count(), 0)
+        self.assertEqual(Pharmacy.objects.count(), 0)
+        self.assertEqual(Laboratory.objects.count(), 0)
+        self.assertEqual(TreeNode.all_objects.count(), 0)
+        self.assertEqual(NodeShare.objects.count(), 0)
+        self.assertEqual(Document.objects.count(), 0)
+
+    def test_seed_reset_clears_session_and_reports_cleared_counts(self):
+        seed_assessment_data(reset=True)
+        session = self.client.session
+        session['entity_type'] = 'pharmacy'
+        session['entity_id'] = 999
+        session.save()
+
+        response = self.client.post(reverse('test-seed-assessment'))
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data['reset'])
+        self.assertGreater(response.data['cleared_before']['tree_nodes'], 0)
+        self.assertNotIn('entity_type', self.client.session)
+        self.assertNotIn('entity_id', self.client.session)
 
 

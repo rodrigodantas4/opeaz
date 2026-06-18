@@ -13,14 +13,26 @@ python manage.py runserver
 
 For manual API checks below, use a second terminal. All examples assume `http://localhost:8000/api/v1` and store the session in `cookies.txt`.
 
+**Entity and node IDs** — SQLite auto-increment PKs change whenever you reseed. Do not hardcode values like `1` or `2`. Resolve IDs from the seed response or the test list endpoints, then export shell variables (examples below use `$PRIMARY_PHARMACY_ID`, `$CPC_ROOT_ID`, etc.).
+
+| What you need | Where to get it |
+|---------------|-----------------|
+| Pharmacy / groupement / laboratory PK | `POST /test/seed/` → `primary_pharmacy_id`, `pharmacies[]`, `groupements[]`, `laboratories[]` — or `GET /test/pharmacies/` (and groupements/laboratories) |
+| Tree node PK | Seed response → `nodes` (e.g. `cpc_root_id`, `vat_leaf_id`) |
+| Session `entity_id` | Any valid PK for the chosen `entity_type` from the tables above |
+| Move `owner_type` / `owner_id` | Must match the **owner** of the node being moved (see node metadata or seed tree) |
+| Share `sharer_type` / `sharer_id` | The entity creating the share (e.g. groupement PK when `sharer_type` is `groupement`) |
+| Share `target.entity_id` | Valid pharmacy PK when scope is `explicit` |
+
 ## Session entity context (PoC)
 
 Tree **read** endpoints require an active entity bound to the Django session. Select it once, then send the session cookie on subsequent requests.
 
 ```bash
+# Replace $PRIMARY_PHARMACY_ID with primary_pharmacy_id from POST /test/seed/ (or any pharmacy id from GET /test/pharmacies/)
 curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
   -H "Content-Type: application/json" \
-  -d '{"entity_type": "pharmacy", "entity_id": 1}'
+  -d '{"entity_type": "pharmacy", "entity_id": '"$PRIMARY_PHARMACY_ID"'}'
 ```
 
 Production would replace session keys with JWT claims; authorization (`TreeService.can_entity_access_node`) stays the same.
@@ -48,7 +60,7 @@ Production would replace session keys with JWT claims; authorization (`TreeServi
 | POST | `test/seed/` | Load assessment PDF example data (labs, groupements, pharmacies, trees) |
 | GET | `test/tree-nodes/{id}/subtree/` | Full nested subtree from a node (session required) |
 
-Query params: `?page=1`, `?page_size=50` (capped at 50). Seed: `?reset=false` to append without clearing (default `reset=true`).
+Query params: `?page=1`, `?page_size=50` (capped at 50). Seed: `?reset=false` to append without clearing (default `reset=true`). With `reset=true`, the endpoint wipes all labs/groupements/pharmacies/trees/shares, clears uploaded files under `media/documents/` and `media/flyers/`, clears the entity session cookie, and returns `cleared_before` row counts in the response.
 
 ---
 
@@ -60,18 +72,29 @@ Each section below maps to a **Decisions at a glance** row in the ADR. Run the s
 
 ```bash
 # Load PDF example data (CPC, Nuxe, Bioderma, three pharmacies, full trees)
-curl -X POST http://localhost:8000/api/v1/test/seed/
+curl -X POST http://localhost:8000/api/v1/test/seed/ | tee seed.json
 
 # Optional: list entities to confirm pagination works
 curl "http://localhost:8000/api/v1/test/pharmacies/?page=1"
 
-# Bind session as Farmácia Central (primary pharmacy from seed; id is usually 1 on fresh DB)
+# Export IDs from the seed response (adjust jq paths if you parse seed.json differently)
+export PRIMARY_PHARMACY_ID=$(jq -r .primary_pharmacy_id seed.json)
+export CPC_GROUPEMENT_ID=$(jq -r '.groupements[0].id' seed.json)
+export NORTE_PHARMACY_ID=$(jq -r '.pharmacies[] | select(.name=="Farmácia Norte") | .id' seed.json)
+export CPC_ROOT_ID=$(jq -r .nodes.cpc_root_id seed.json)
+export CONDITIONS_2025_ID=$(jq -r .nodes.conditions_2025_id seed.json)
+export CONDITIONS_LEAF_ID=$(jq -r .nodes.conditions_leaf_id seed.json)
+export VAT_LEAF_ID=$(jq -r .nodes.vat_leaf_id seed.json)
+export MY_DOCUMENTS_ID=$(jq -r .nodes.my_documents_id seed.json)
+export FLYER_LEAF_ID=$(jq -r .nodes.flyer_leaf_id seed.json)
+
+# Bind session as Farmácia Central (primary_pharmacy_id from seed)
 curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
   -H "Content-Type: application/json" \
-  -d '{"entity_type": "pharmacy", "entity_id": 1}'
+  -d '{"entity_type": "pharmacy", "entity_id": '"$PRIMARY_PHARMACY_ID"'}'
 ```
 
-Save node IDs from the seed response `nodes` object (e.g. `cpc_root_id`, `conditions_2025_id`, `conditions_leaf_id`, `nuxe_root_id`, `my_documents_id`, `vat_leaf_id`). Replace `$ID` placeholders below with those values.
+Save node IDs from the seed response `nodes` object if you are not using the `export` lines above. Replace `$…` placeholders in later steps with those values.
 
 Automated regression for the whole PoC:
 
@@ -101,12 +124,12 @@ curl -b cookies.txt "http://localhost:8000/api/v1/tree-nodes/$CONDITIONS_2025_ID
 
 Expect one leaf: `Condições gerais`.
 
-3. **Move node** — reparent the VAT leaf under `Meus documentos` (already its parent in seed; move to same parent is idempotent, or pick another owned folder):
+3. **Move node** — reparent the VAT leaf under `Meus documentos` (already its parent in seed; move to same parent is idempotent, or pick another owned folder). `owner_type` / `owner_id` must be the **owner** of the node (Farmácia Central for the VAT leaf):
 
 ```bash
 curl -b cookies.txt -X PATCH "http://localhost:8000/api/v1/tree-nodes/$VAT_LEAF_ID/move/" \
   -H "Content-Type: application/json" \
-  -d '{"owner_type": "pharmacy", "owner_id": 1, "parent_id": '$MY_DOCUMENTS_ID'}'
+  -d '{"owner_type": "pharmacy", "owner_id": '"$PRIMARY_PHARMACY_ID"', "parent_id": '"$MY_DOCUMENTS_ID"'}'
 ```
 
 Expect `200` and `"parent_id": <my_documents_id>`. Re-fetch children of `Meus documentos` to confirm the leaf appears there.
@@ -139,12 +162,12 @@ Shared roots should include `shared_by.entity_type` (`groupement` or `laboratory
 
 **What to prove:** groupement share reaches all member pharmacies; lab share is explicit; descendants inherit access without extra share rows.
 
-1. **Groupement_all (CPC)** — as Farmácia Central, `/children/` on `cpc_root_id` works (step Q1). Bind **Farmácia Norte** (another CPC member) and repeat:
+1. **Groupement_all (CPC)** — as Farmácia Central, `/children/` on `cpc_root_id` works (step Q1). Bind **Farmácia Norte** (another CPC member — use its `id` from `pharmacies[]` in the seed response, e.g. `$NORTE_PHARMACY_ID`) and repeat:
 
 ```bash
 curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
   -H "Content-Type: application/json" \
-  -d '{"entity_type": "pharmacy", "entity_id": 2}'
+  -d '{"entity_type": "pharmacy", "entity_id": '"$NORTE_PHARMACY_ID"'}'
 
 curl -b cookies.txt "http://localhost:8000/api/v1/tree-nodes/$CPC_ROOT_ID/children/"
 ```
@@ -153,16 +176,16 @@ Expect the same two folders without creating a new share.
 
 2. **Explicit lab share (Nuxe → Farmácia Central only)** — Central sees `Nuxe` in bootstrap; bind a pharmacy **outside** CPC membership (create via admin or DB) and confirm `403` with `"Entity does not have permission"` on Nuxe children.
 
-3. **Create share** — groupement shares a new folder with one pharmacy:
+3. **Create share** — groupement shares a new folder with one pharmacy. Use the groupement PK for `sharer_id` and a valid pharmacy PK for the target (both from seed or list endpoints):
 
 ```bash
 curl -b cookies.txt -X POST "http://localhost:8000/api/v1/tree-nodes/$FOLDER_ID/shares/" \
   -H "Content-Type: application/json" \
   -d '{
     "sharer_type": "groupement",
-    "sharer_id": 1,
+    "sharer_id": '"$CPC_GROUPEMENT_ID"',
     "scope": "explicit",
-    "target": {"entity_type": "pharmacy", "entity_id": 1}
+    "target": {"entity_type": "pharmacy", "entity_id": '"$PRIMARY_PHARMACY_ID"'}
   }'
 ```
 
@@ -232,7 +255,7 @@ curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
 
 2. **Access control** — bind a pharmacy with no shares and request CPC children → `403` with `"Entity does not have permission"`.
 
-3. **Owner-only move** — PATCH move with wrong `owner_type` / `owner_id` → `400` “Only the node owner can move”.
+3. **Owner-only move** — PATCH move with `owner_type` / `owner_id` that do not match the node’s actual owner → `400` “Only the node owner can move” (e.g. pass a laboratory id while moving a pharmacy-owned leaf).
 
 4. **Soft delete** — `TreeNode` default manager excludes `deleted_at` set rows ([`TreeNodeManager.alive`](document_tree/models.py)). Restore/delete API is out of PoC scope; verify via Django admin or shell if needed.
 

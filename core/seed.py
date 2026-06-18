@@ -1,7 +1,9 @@
 """Assessment reference data — mirrors the Document Tree technical test PDF example."""
 
+import shutil
 from datetime import date
 
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.files.base import ContentFile
 from django.db import transaction
@@ -38,28 +40,64 @@ def _leaf(name, owner, content_obj, parent=None):
     )
 
 
-def _clear_assessment_data():
+def _delete_file_fields(queryset, *field_names):
+    for obj in queryset.iterator():
+        for field_name in field_names:
+            field_file = getattr(obj, field_name, None)
+            if field_file:
+                field_file.delete(save=False)
+
+
+def _assessment_row_counts():
+    return {
+        'groupements': Groupement.objects.count(),
+        'pharmacies': Pharmacy.objects.count(),
+        'laboratories': Laboratory.objects.count(),
+        'tree_nodes': TreeNode.all_objects.count(),
+        'node_shares': NodeShare.objects.count(),
+        'documents': Document.objects.count(),
+        'flyers': Flyer.objects.count(),
+        'commercial_conditions': CommercialCondition.objects.count(),
+    }
+
+
+def _clear_assessment_media():
+    for subdir in ('documents', 'flyers'):
+        path = settings.MEDIA_ROOT / subdir
+        if path.is_dir():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _clear_assessment_data_in_transaction():
     """TODO(test-validation): wipe seeded data before reload."""
     NodeShare.objects.all().delete()
+    TreeNode.all_objects.update(parent=None)
     TreeNode.all_objects.all().delete()
-    CommercialCondition.objects.all().delete()
-    Flyer.objects.all().delete()
-    Document.objects.all().delete()
+
+    for model, file_fields in (
+        (CommercialCondition, ()),
+        (Flyer, ('image',)),
+        (Document, ('file',)),
+    ):
+        qs = model.objects.all()
+        if file_fields:
+            _delete_file_fields(qs, *file_fields)
+        qs.delete()
+
     Pharmacy.objects.all().delete()
     Groupement.objects.all().delete()
     Laboratory.objects.all().delete()
+    _clear_assessment_media()
 
 
-@transaction.atomic
-def seed_assessment_data(*, reset: bool = True) -> dict:
-    """
-    Load labs, groupements, pharmacies and document trees from the assessment PDF example.
+def _clear_assessment_data():
+    """TODO(test-validation): wipe seeded data and uploaded media before reload."""
+    with transaction.atomic():
+        _clear_assessment_data_in_transaction()
 
-    TODO(test-validation): for PoC / manual API testing only — remove before production.
-    """
-    if reset:
-        _clear_assessment_data()
 
+def _create_assessment_data():
     # --- Entities (PDF context: CPC groupement, Nuxe/Bioderma labs, member pharmacies) ---
     groupement_cpc = Groupement.objects.create(name='CPC')
     lab_nuxe = Laboratory.objects.create(name='Nuxe', code='NUXE')
@@ -153,3 +191,23 @@ def seed_assessment_data(*, reset: bool = True) -> dict:
             'commercial_condition_id': condition_general.pk,
         },
     }
+
+
+def seed_assessment_data(*, reset: bool = True) -> dict:
+    """
+    Load labs, groupements, pharmacies and document trees from the assessment PDF example.
+
+    TODO(test-validation): for PoC / manual API testing only — remove before production.
+    """
+    cleared_before = None
+    if reset:
+        cleared_before = _assessment_row_counts()
+        _clear_assessment_data()
+
+    with transaction.atomic():
+        payload = _create_assessment_data()
+
+    payload['reset'] = reset
+    if cleared_before is not None:
+        payload['cleared_before'] = cleared_before
+    return payload

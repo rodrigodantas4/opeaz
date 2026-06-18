@@ -4,6 +4,7 @@ __pycache__/
 db.sqlite3
 media/
 .env
+cookies.txt
 .venv/
 venv/
 *.egg-info/

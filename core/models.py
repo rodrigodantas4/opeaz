@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError
 from django.db import models
 
 
@@ -42,6 +43,11 @@ class Flyer(models.Model):
     image = models.ImageField(upload_to='flyers/')
     start_at = models.DateField()
     end_at = models.DateField()
+
+    def clean(self):
+        super().clean()
+        if self.start_at and self.end_at and self.start_at > self.end_at:
+            raise ValidationError({'end_at': 'End date must be on or after start date.'})
 
     def __str__(self):
         return self.title

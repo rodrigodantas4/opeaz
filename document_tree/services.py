@@ -5,8 +5,9 @@ from django.db.models import Q
 
 from core.models import Groupement, Pharmacy
 
-from .models import NodeShare, ShareScope, TreeNode
-from .validators import get_content_type_for_model, get_entity
+from .models import NodeShare, NodeType, ShareScope, TreeNode
+from .request_cache import get_cached_shares
+from .validators import get_content_type_for_model, validate_tree_node
 
 
 class TreeService:
@@ -18,19 +19,19 @@ class TreeService:
         return Q(owner_content_type=ct, owner_object_id=entity.pk)
 
     @classmethod
-    def get_children(cls, node: TreeNode, entity):
-        return (
-            TreeNode.objects.filter(parent=node)
-            .order_by('name')
-        )
+    def get_children(cls, node: TreeNode, _entity, request=None):
+        """Return direct children; access is enforced on the parent node before calling."""
+        return TreeNode.objects.filter(parent=node).order_by('name')
 
     @classmethod
     def get_breadcrumb(cls, node: TreeNode):
         chain = []
         current = node
-        while current is not None:
+        depth = 0
+        while current is not None and depth < cls.MAX_DEPTH:
             chain.append(current)
             current = current.parent
+            depth += 1
         chain.reverse()
         return chain
 
@@ -47,6 +48,28 @@ class TreeService:
 
     @classmethod
     @transaction.atomic
+    def create_node(cls, *, name, node_type, owner, parent=None, content_obj=None):
+        owner_ct = get_content_type_for_model(owner.__class__)
+        content_ct = None
+        content_id = None
+        if content_obj is not None:
+            content_ct = get_content_type_for_model(content_obj.__class__)
+            content_id = content_obj.pk
+        node = TreeNode(
+            name=name,
+            node_type=node_type,
+            parent=parent,
+            owner_content_type=owner_ct,
+            owner_object_id=owner.pk,
+            content_content_type=content_ct,
+            content_object_id=content_id,
+        )
+        validate_tree_node(node)
+        node.save()
+        return node
+
+    @classmethod
+    @transaction.atomic
     def move_node(cls, node: TreeNode, new_parent: TreeNode | None):
         if new_parent and cls._is_ancestor(node, new_parent):
             raise ValidationError('Cannot move a node into its own descendant')
@@ -59,25 +82,28 @@ class TreeService:
         return node
 
     @classmethod
-    def get_applicable_shares(cls, entity) -> list[NodeShare]:
-        entity_ct = get_content_type_for_model(entity.__class__)
-        q = Q(scope=ShareScope.EXPLICIT, target_content_type=entity_ct, target_object_id=entity.pk)
+    def get_applicable_shares(cls, entity, request=None) -> list[NodeShare]:
+        def fetch():
+            entity_ct = get_content_type_for_model(entity.__class__)
+            q = Q(scope=ShareScope.EXPLICIT, target_content_type=entity_ct, target_object_id=entity.pk)
 
-        if isinstance(entity, Pharmacy) and entity.groupement_id:
-            grp_ct = get_content_type_for_model(Groupement)
-            q |= Q(scope=ShareScope.EXPLICIT, target_content_type=grp_ct, target_object_id=entity.groupement_id)
-            q |= Q(scope=ShareScope.GROUPEMENT_ALL, groupement_id=entity.groupement_id)
+            if isinstance(entity, Pharmacy) and entity.groupement_id:
+                grp_ct = get_content_type_for_model(Groupement)
+                q |= Q(scope=ShareScope.EXPLICIT, target_content_type=grp_ct, target_object_id=entity.groupement_id)
+                q |= Q(scope=ShareScope.GROUPEMENT_ALL, groupement_id=entity.groupement_id)
 
-        return list(
-            NodeShare.objects.filter(q)
-            .select_related(
-                'node', 'shared_by_content_type', 'groupement',
-                'target_content_type',
+            return list(
+                NodeShare.objects.filter(q)
+                .select_related(
+                    'node', 'shared_by_content_type', 'groupement',
+                    'target_content_type',
+                )
             )
-        )
+
+        return get_cached_shares(request, entity, fetch)
 
     @classmethod
-    def _share_metadata_for_node(cls, node: TreeNode, shares: list[NodeShare]):
+    def share_metadata_for_node(cls, node: TreeNode, shares: list[NodeShare]):
         for share in shares:
             if share.node_id == node.pk or cls._is_ancestor(share.node, node):
                 sharer = share.shared_by_content_type.model
@@ -93,26 +119,25 @@ class TreeService:
         return {'is_shared': False, 'shared_by': None}
 
     @classmethod
-    def can_entity_access_node(cls, node: TreeNode, entity) -> bool:
+    def can_entity_access_node(cls, node: TreeNode, entity, request=None) -> bool:
         owner_ct = get_content_type_for_model(entity.__class__)
         if node.owner_content_type_id == owner_ct.id and node.owner_object_id == entity.pk:
             return True
-        shares = cls.get_applicable_shares(entity)
+        shares = cls.get_applicable_shares(entity, request=request)
         for share in shares:
             if share.node_id == node.pk or cls._is_ancestor(share.node, node):
                 return True
         return False
 
     @classmethod
-    def build_aggregated_view(cls, entity_type: str, entity_id: int):
-        entity = get_entity(entity_type, entity_id)
+    def build_aggregated_view(cls, entity, request=None):
         owner_q = cls._owner_filter(entity)
 
         own_roots = TreeNode.objects.filter(owner_q, parent__isnull=True).order_by('name')
         own_root_ids = list(own_roots.values_list('pk', flat=True))
         own_children = TreeNode.objects.filter(owner_q, parent_id__in=own_root_ids).order_by('name')
 
-        shares = cls.get_applicable_shares(entity)
+        shares = cls.get_applicable_shares(entity, request=request)
         shared_root_ids = {s.node_id for s in shares}
         shared_roots = TreeNode.objects.filter(pk__in=shared_root_ids).order_by('name')
         shared_children = TreeNode.objects.filter(parent_id__in=shared_root_ids).order_by('name')
@@ -129,7 +154,7 @@ class TreeService:
                 node.owner_content_type_id == entity_ct.id
                 and node.owner_object_id == entity.pk
             )
-            meta = cls._share_metadata_for_node(node, shares) if not is_owned else {
+            meta = cls.share_metadata_for_node(node, shares) if not is_owned else {
                 'is_shared': False, 'shared_by': None,
             }
             if not is_owned and not meta['is_shared']:

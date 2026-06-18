@@ -720,7 +720,7 @@ flowchart LR
 
 **Production (documented, not implemented in PoC):** migrate to **JWT claim** (`entity_type`, `entity_id` in token). The `TreeService` layer receives the already-resolved entity — switching mechanism stays isolated in DRF authentication.
 
-**Mutations (PoC):** share and move endpoints still accept `sharer_type` / `owner_type` in the request body; binding mutations to session is a follow-up.
+**Mutations (PoC):** share and move endpoints use **session-first** identity via `OptionalEntitySessionAuthentication`. When a session entity is bound, it is the sharer/owner and body `sharer_type`/`owner_type` fields are ignored. When no session is present, those body fields are accepted as a **manual testing fallback** (documented in README PoC limitations). Production should require JWT/session only.
 
 ### Defense layers
 
@@ -877,13 +877,14 @@ Rationale: compatible with tree UI components (MUI TreeView, react-arborist), pa
 | `GET`  | `/api/v1/entities/tree/`                           | Aggregated view (own + shared)   |
 | `GET`  | `/api/v1/tree-nodes/{id}/children/`                | Direct children of a node        |
 | `GET`  | `/api/v1/tree-nodes/{id}/content/`                 | Resolve leaf → underlying object |
-| `POST` | `/api/v1/tree-nodes/{id}/shares/`                  | Share node                       |
+| `POST` | `/api/v1/tree-nodes/{id}/shares/`                  | Share node (session-first)       |
+| `GET`  | `/api/v1/media/{path}`                             | Signed media download            |
 
 
 **Additional endpoints (Phase 2):**
 
 - `GET /api/v1/tree-nodes/{id}/breadcrumb/`
-- `PATCH /api/v1/tree-nodes/{id}/move/`
+- `PATCH /api/v1/tree-nodes/{id}/move/` (session-first; optional body identity when no session)
 
 ### Own vs shared distinction
 
@@ -1190,5 +1191,11 @@ Minimum metrics before scaling mitigations:
 - p99 aggregated view > 500 ms for 5 min → review cache (R1)
 - move updates > 100 rows (MP) → alert product / throttling (R6)
 - share count per pharmacy > 100 → review share modeling (R5)
+
+---
+
+## PoC known limitations
+
+See [README.md](../../README.md#poc-limitations) for the full table. Summary: session binding has no user authentication; share/move accept optional body identity when no session; test routes are DEBUG-only; `NodeShare.permission` is unused; content/tree owner alignment is not enforced; SQLite is used instead of PostgreSQL for local dev.
 
 ---

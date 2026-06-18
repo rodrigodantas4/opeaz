@@ -5,13 +5,10 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 
-from document_tree.test_utils import bind_entity_session
-
-from document_tree.tests import AssessmentFixtureMixin
-
-
-
 from document_tree.models import NodeShare, TreeNode
+from document_tree.services import TreeService
+from document_tree.test_utils import bind_entity_session
+from document_tree.tests import AssessmentFixtureMixin, make_folder
 
 from .models import Document, Groupement, Laboratory, Pharmacy
 
@@ -73,8 +70,13 @@ class TestTreeNodeSubtreeTests(AssessmentFixtureMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(response.data['detail'], 'Entity does not have permission')
 
-
-
+    def test_subtree_max_depth_returns_400(self):
+        parent = self.cpc_root
+        for i in range(TreeService.MAX_DEPTH + 2):
+            parent = make_folder(f'Level {i}', self.groupement, parent=parent)
+        url = reverse('test-tree-node-subtree', kwargs={'node_id': self.cpc_root.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
 class ValidationEntityListTests(APITestCase):
@@ -202,4 +204,9 @@ class SeedAssessmentDataTests(APITestCase):
         self.assertNotIn('entity_type', self.client.session)
         self.assertNotIn('entity_id', self.client.session)
 
+    def test_seed_reset_false_fails_on_duplicate_codes(self):
+        seed_assessment_data(reset=True)
+        from django.db import IntegrityError
+        with self.assertRaises(IntegrityError):
+            seed_assessment_data(reset=False)
 

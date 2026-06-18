@@ -20,8 +20,7 @@ For manual API checks below, use a second terminal. All examples assume `http://
 | Pharmacy / groupement / laboratory PK | `POST /test/seed/` → `primary_pharmacy_id`, `pharmacies[]`, `groupements[]`, `laboratories[]` — or `GET /test/pharmacies/` (and groupements/laboratories) |
 | Tree node PK | Seed response → `nodes` (e.g. `cpc_root_id`, `vat_leaf_id`) |
 | Session `entity_id` | Any valid PK for the chosen `entity_type` from the tables above |
-| Move `owner_type` / `owner_id` | Must match the **owner** of the node being moved (see node metadata or seed tree) |
-| Share `sharer_type` / `sharer_id` | The entity creating the share (e.g. groupement PK when `sharer_type` is `groupement`) |
+| Move / share identity | **Session-first** when cookies are sent; optional body `owner_*` / `sharer_*` only when no session (PoC manual testing) |
 | Share `target.entity_id` | Valid pharmacy PK when scope is `explicit` |
 
 ## Session entity context (PoC)
@@ -37,6 +36,8 @@ curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
 
 Production would replace session keys with JWT claims; authorization (`TreeService.can_entity_access_node`) stays the same.
 
+**Mutations (share / move):** when a session entity is bound, it is used as the sharer/owner and any body identity fields are **ignored**. Without a session, `sharer_type`/`sharer_id` or `owner_type`/`owner_id` in the body are accepted for isolated manual testing (see [PoC limitations](#poc-limitations)).
+
 ## API (base `/api/v1/`)
 
 | Method | Path | Description |
@@ -46,11 +47,14 @@ Production would replace session keys with JWT claims; authorization (`TreeServi
 | GET | `entities/tree/` | Aggregated bootstrap view (session required) |
 | GET | `tree-nodes/{id}/children/` | List child nodes (session required) |
 | GET | `tree-nodes/{id}/content/` | Resolve leaf content (session required) |
-| POST | `tree-nodes/{id}/shares/` | Create share |
+| POST | `tree-nodes/{id}/shares/` | Create share (session-first; body identity fallback) |
 | GET | `tree-nodes/{id}/breadcrumb/` | Breadcrumb path (session required) |
-| PATCH | `tree-nodes/{id}/move/` | Reparent node (owner context in body) |
+| PATCH | `tree-nodes/{id}/move/` | Reparent node (session-first; body identity fallback) |
+| GET | `media/{path}?expires=&sig=` | Signed file/image download (from content URLs) |
 
 ### Test / validation only (TODO — remove before production)
+
+Available when `DEBUG=True` or during `manage.py test`. **Not mounted when `DEBUG=False`.**
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -124,13 +128,15 @@ curl -b cookies.txt "http://localhost:8000/api/v1/tree-nodes/$CONDITIONS_2025_ID
 
 Expect one leaf: `Condições gerais`.
 
-3. **Move node** — reparent the VAT leaf under `Meus documentos` (already its parent in seed; move to same parent is idempotent, or pick another owned folder). `owner_type` / `owner_id` must be the **owner** of the node (Farmácia Central for the VAT leaf):
+3. **Move node** — reparent the VAT leaf (session bound as Farmácia Central; no body identity needed):
 
 ```bash
 curl -b cookies.txt -X PATCH "http://localhost:8000/api/v1/tree-nodes/$VAT_LEAF_ID/move/" \
   -H "Content-Type: application/json" \
-  -d '{"owner_type": "pharmacy", "owner_id": '"$PRIMARY_PHARMACY_ID"', "parent_id": '"$MY_DOCUMENTS_ID"'}'
+  -d '{"parent_id": '"$MY_DOCUMENTS_ID"'}'
 ```
+
+PoC fallback without cookies: add `"owner_type": "pharmacy", "owner_id": '"$PRIMARY_PHARMACY_ID"'` to the JSON body.
 
 Expect `200` and `"parent_id": <my_documents_id>`. Re-fetch children of `Meus documentos` to confirm the leaf appears there.
 
@@ -176,14 +182,16 @@ Expect the same two folders without creating a new share.
 
 2. **Explicit lab share (Nuxe → Farmácia Central only)** — Central sees `Nuxe` in bootstrap; bind a pharmacy **outside** CPC membership (create via admin or DB) and confirm `403` with `"Entity does not have permission"` on Nuxe children.
 
-3. **Create share** — groupement shares a new folder with one pharmacy. Use the groupement PK for `sharer_id` and a valid pharmacy PK for the target (both from seed or list endpoints):
+3. **Create share** — bind session as CPC groupement first, then share (body identity not needed when session is set):
 
 ```bash
+curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
+  -H "Content-Type: application/json" \
+  -d '{"entity_type": "groupement", "entity_id": '"$CPC_GROUPEMENT_ID"'}'
+
 curl -b cookies.txt -X POST "http://localhost:8000/api/v1/tree-nodes/$FOLDER_ID/shares/" \
   -H "Content-Type: application/json" \
   -d '{
-    "sharer_type": "groupement",
-    "sharer_id": '"$CPC_GROUPEMENT_ID"',
     "scope": "explicit",
     "target": {"entity_type": "pharmacy", "entity_id": '"$PRIMARY_PHARMACY_ID"'}
   }'
@@ -255,7 +263,7 @@ curl -c cookies.txt -X POST http://localhost:8000/api/v1/session/entity/ \
 
 2. **Access control** — bind a pharmacy with no shares and request CPC children → `403` with `"Entity does not have permission"`.
 
-3. **Owner-only move** — PATCH move with `owner_type` / `owner_id` that do not match the node’s actual owner → `400` “Only the node owner can move” (e.g. pass a laboratory id while moving a pharmacy-owned leaf).
+3. **Owner-only move** — bind session as a non-owner entity (e.g. laboratory) and PATCH move on a pharmacy-owned leaf → `400` “Only the node owner can move”.
 
 4. **Soft delete** — `TreeNode` default manager excludes `deleted_at` set rows ([`TreeNodeManager.alive`](document_tree/models.py)). Restore/delete API is out of PoC scope; verify via Django admin or shell if needed.
 
@@ -303,6 +311,24 @@ Expect ordered names: `CPC` → `Condições 2025` → `Condições gerais`.
 
 ---
 
+## PoC limitations
+
+Intentional shortcuts for the assessment PoC. **Not production-ready** without addressing these.
+
+| Topic | PoC behavior | Production follow-up |
+|-------|--------------|---------------------|
+| Session binding | Anyone can `POST /session/entity/` as any entity (no user login) | JWT/OAuth; real authentication |
+| Mutation body fallback | Share/move accept body `sharer_*` / `owner_*` when no session | Session or JWT claims only |
+| Signed URLs | Verified via `GET /api/v1/media/…?expires=&sig=` | S3 presigned URLs or CDN |
+| Test routes | Mounted when `DEBUG=True` or during tests | Removed entirely |
+| `permission` field on `NodeShare` | Schema only; not enforced | RBAC / read-write grants |
+| Content vs tree owner | Not enforced (seed may cross-link) | Business rule in `TreeNodeService` |
+| Orphan content on delete | Possible | CASCADE or cleanup job |
+| Database | SQLite in dev | PostgreSQL + recursive CTE for breadcrumbs |
+| Breadcrumb/subtree depth | Python walk capped at `MAX_DEPTH=20` | Recursive CTE at scale |
+
+---
+
 ## Quick reference — seed node names (PDF example)
 
 | Node | Owner |
@@ -318,7 +344,7 @@ Shares: CPC root → `groupement_all`; Nuxe root → explicit to Farmácia Centr
 
 ## Phase 2 — automated test mapping
 
-Each README validation step has a corresponding test (run via `python manage.py test`).
+Each README validation step has a corresponding test (run via `python manage.py test` — **70 tests**).
 
 | README section | Scenario | Test(s) |
 |----------------|----------|---------|

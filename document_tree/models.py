@@ -16,7 +16,6 @@ class ShareScope(models.TextChoices):
 
 
 ALLOWED_OWNER_MODELS = (Laboratory, Groupement, Pharmacy)
-ALLOWED_CONTENT_MODELS = ()  # populated after imports to avoid circular refs
 
 
 class TreeNodeQuerySet(models.QuerySet):
@@ -96,8 +95,18 @@ class NodeShare(models.Model):
         constraints = [
             models.CheckConstraint(
                 check=(
-                    Q(scope='explicit', target_content_type__isnull=False, target_object_id__isnull=False, groupement__isnull=True)
-                    | Q(scope='groupement_all', groupement__isnull=False, target_content_type__isnull=True, target_object_id__isnull=True)
+                    Q(
+                        scope=ShareScope.EXPLICIT,
+                        target_content_type__isnull=False,
+                        target_object_id__isnull=False,
+                        groupement__isnull=True,
+                    )
+                    | Q(
+                        scope=ShareScope.GROUPEMENT_ALL,
+                        groupement__isnull=False,
+                        target_content_type__isnull=True,
+                        target_object_id__isnull=True,
+                    )
                 ),
                 name='nodeshare_scope_consistency',
             ),
